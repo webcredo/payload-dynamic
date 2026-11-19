@@ -34,11 +34,19 @@ The application queries the entries collection with a `definition` filter for th
 
 Remove incoming **Relationship** and **Upload** references before deleting an entry or file. When you save an entry, the plugin validates its values against the current field settings.
 
-This is an unpublished prerelease. It has not been published to npm.
+## Install
 
-## Build and install a local tarball
+Install the beta from npm.
 
-From this repository:
+```sh
+npm install payload-dynamic@beta
+```
+
+If the npm beta tag is not available yet, install the tarball from the [GitHub prerelease](https://github.com/webcredo/payload-dynamic/releases/tag/v0.1.0), or install a local copy with `npm install ./payload-dynamic-0.1.0.tgz`.
+
+### Build a tarball from source
+
+Run these commands from the repository root.
 
 ```sh
 npm install
@@ -46,10 +54,13 @@ npm run check
 npm pack
 ```
 
-`npm pack` builds JavaScript and TypeScript declarations. In a **separate clean Payload project**, using the versions above:
+`npm pack` builds JavaScript and TypeScript declarations. Install the tarball in your Payload project.
+
+### Install peers
+
+Use the versions above and install the required rich text peer and your chosen database adapter.
 
 ```sh
-npm install /absolute/path/payload-dynamic-0.1.0.tgz
 # Required peer with either adapter:
 npm install @payloadcms/richtext-lexical@4.0.0-beta.9
 # SQLite application:
