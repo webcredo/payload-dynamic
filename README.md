@@ -1,5 +1,7 @@
 # payload-dynamic
 
+[![npm beta version](https://img.shields.io/npm/v/payload-dynamic/beta?label=npm%20beta)](https://www.npmjs.com/package/payload-dynamic)
+
 A Payload plugin for defining record types, fields, and relationships in the admin panel. It stores definitions and records in native Payload collections, with typed SQL values, field validation, access control, and reference checks.
 
 ## How it works
