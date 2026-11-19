@@ -1,0 +1,12 @@
+/node_modules/
+/.next/
+/.env*
+!/.env.example
+/next-env.d.ts
+/*.tsbuildinfo
+/*.db*
+/demo-media/
+/dist/
+*.tgz
+/artifacts/
+/.DS_Store

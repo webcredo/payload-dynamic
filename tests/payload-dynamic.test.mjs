@@ -1,0 +1,1143 @@
+import assert from 'node:assert/strict'
+import { randomBytes, randomUUID } from 'node:crypto'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { test } from 'node:test'
+import { pathToFileURL } from 'node:url'
+import { postgresAdapter } from '@payloadcms/db-postgres'
+import { sqliteAdapter } from '@payloadcms/db-sqlite'
+import { buildConfig, createPayloadRequest, getPayload, handleEndpoints } from 'payload'
+import { payloadDynamic } from '../src/payload-dynamic/index.ts'
+
+process.env.DISABLE_PAYLOAD_HMR = 'true'
+process.env.PAYLOAD_DROP_DATABASE = 'false'
+
+const definitionSlug = 'collections'
+const entrySlug = 'entries'
+const definitions = `/api/${definitionSlug}`
+const entries = `/api/${entrySlug}`
+const day = '2026-11-16T00:00:00.000Z'
+
+const capacity = { key: 'capacity', label: 'Capacity', fieldType: 'number', min: 0, max: 500 }
+const fields = [
+  { ...capacity, required: true },
+  { key: 'parking', label: 'Parking', fieldType: 'number', defaultNumber: 0 },
+  {
+    key: 'address',
+    label: 'Address',
+    fieldType: 'text',
+    minLength: 4,
+    maxLength: 60,
+    defaultText: 'North wing',
+  },
+  { key: 'note', label: 'Note', fieldType: 'textarea', maxLength: 100 },
+  { key: 'contact', label: 'Contact', fieldType: 'email' },
+  { key: 'open', label: 'Open', fieldType: 'checkbox', defaultChecked: false },
+  { key: 'opens', label: 'Opens', fieldType: 'date', defaultDate: day },
+  {
+    key: 'tier',
+    label: 'Tier',
+    fieldType: 'select',
+    options: [
+      { label: 'Standard', value: 'standard' },
+      { label: 'Premium', value: 'premium' },
+    ],
+    defaultOption: 'standard',
+  },
+]
+
+function namedField(fields, name) {
+  const field = fields.find((candidate) => candidate.name === name)
+  assert.ok(field, `Missing native field ${name}`)
+  return field
+}
+
+async function request({ config, key, token }, method, path, status, body) {
+  const headers = new Headers()
+  if (token) headers.set('Authorization', `JWT ${token}`)
+  if (body !== undefined) headers.set('Content-Type', 'application/json')
+  const response = await handleEndpoints({
+    config,
+    payloadInstanceCacheKey: key,
+    request: new Request(`http://localhost${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }),
+  })
+  const result = response.status === 204 ? undefined : await response.json()
+  const detail = JSON.stringify(result)?.slice(0, 500) ?? ''
+  assert.equal(response.status, status, `${method} ${path}: ${detail}`)
+  return result
+}
+
+async function withFixture(run, postgresURL, pluginOptions, hostCollections = []) {
+  const dir = await mkdtemp(join(tmpdir(), 'payload-dynamic-test-'))
+  const dbURL = pathToFileURL(join(dir, 'db.sqlite')).href
+  const key = randomUUID()
+  const schemaName = `payload_test_${key.replaceAll('-', '')}`
+  const email = 'manager@example.test'
+  const password = randomBytes(24).toString('hex')
+  const isManager = ({ req }) => req.user?.email === email
+  const config = buildConfig({
+    secret: randomBytes(32).toString('hex'),
+    admin: { user: 'users' },
+    db: postgresURL
+      ? postgresAdapter({
+          pool: { connectionString: postgresURL, connectionTimeoutMillis: 5_000 },
+          disableCreateDatabase: true,
+          push: true,
+          schemaName,
+        })
+      : sqliteAdapter({ client: { url: dbURL }, push: true }),
+    graphQL: { disable: true },
+    logger: { options: { level: 'fatal' } },
+    telemetry: false,
+    typescript: { autoGenerate: false },
+    collections: [
+      { slug: 'users', auth: true, fields: [] },
+      {
+        slug: 'media',
+        upload: { staticDir: join(dir, 'media') },
+        access: { read: isManager, create: isManager, delete: isManager },
+        fields: [],
+      },
+      ...hostCollections,
+    ],
+    plugins: [
+      payloadDynamic({ canManage: isManager, uploadCollection: 'media', ...pluginOptions }),
+    ],
+  })
+  let payload
+  try {
+    payload = await getPayload({ config, key, disableDBConnect: Boolean(postgresURL) })
+    if (postgresURL) await payload.db.connect()
+    async function login(userEmail) {
+      const user = await payload.create({
+        collection: 'users',
+        overrideAccess: true,
+        data: { email: userEmail, password },
+      })
+      const { token } = await payload.login({
+        collection: 'users',
+        data: { email: userEmail, password },
+      })
+      assert.ok(token)
+      return { request: request.bind(null, { config, key, token }), user }
+    }
+    const { request: manager, user } = await login(email)
+    const { request: outsider, user: outsiderUser } = await login('other@example.test')
+    await run({
+      payload,
+      manager,
+      outsider,
+      outsiderUser,
+      schemaName,
+      user,
+      anonymous: request.bind(null, { config, key }),
+    })
+  } finally {
+    try {
+      if (payload) {
+        try {
+          if (postgresURL)
+            await payload.db.pool?.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`)
+        } finally {
+          try {
+            await payload.destroy()
+          } finally {
+            if (postgresURL) await payload.db.pool?.end()
+            else payload.db.client.close()
+          }
+        }
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+}
+
+const createDefinition = async (call, title, slug, schema, endpoint = definitions) =>
+  (await call('POST', `${endpoint}?depth=0`, 201, { title, slug, fields: schema })).doc
+
+const createEntry = async (call, title, definition, values, endpoint = entries) =>
+  (await call('POST', `${endpoint}?depth=0`, 201, { title, definition, values })).doc
+
+function value(record, key, column) {
+  return nestedValue(record.values, key, column)
+}
+
+function valueRow(rows, key) {
+  const row = rows.find(({ fieldKey }) => fieldKey === key)
+  assert.ok(row, `Missing stored row for ${key}`)
+  return row
+}
+
+function nestedValue(items, key, column) {
+  return valueRow(items, key)[column]
+}
+
+async function assertNativeStorage(payload) {
+  const definition = payload.collections[definitionSlug].config
+  const entry = payload.collections[entrySlug].config
+  const definitionFields = namedField(definition.fields, 'fields')
+  const entryValues = namedField(entry.fields, 'values')
+  assert.equal(definitionFields.type, 'array')
+  assert.equal(entryValues.type, 'array')
+  const typeSelect = namedField(definitionFields.fields, 'fieldType')
+  assert.equal(typeSelect.type, 'select')
+  assert.deepEqual(
+    new Set(
+      typeSelect.options.map((option) => (typeof option === 'string' ? option : option.value)),
+    ),
+    new Set([
+      ...fields.map(({ fieldType }) => fieldType),
+      'relationship',
+      'upload',
+      'code',
+      'radio',
+      'slug',
+      'group',
+      'array',
+      'tabs',
+      'blocks',
+    ]),
+  )
+  assert.equal(Boolean(namedField(definitionFields.fields, 'label').required), false)
+  assert.equal(namedField(definitionFields.fields, 'fields').type, 'array')
+  assert.equal(namedField(entryValues.fields, 'rows').type, 'array')
+  assert.equal(namedField(namedField(entryValues.fields, 'rows').fields, 'items').type, 'array')
+  const minimum = namedField(definitionFields.fields, 'min')
+  assert.equal(minimum.type, 'number')
+  assert.equal(minimum.admin.condition({}, { fieldType: 'number' }), true)
+  assert.equal(minimum.admin.condition({}, { fieldType: 'text' }), false)
+  const options = namedField(definitionFields.fields, 'options')
+  assert.equal(options.type, 'array')
+  assert.equal(options.admin.condition({}, { fieldType: 'select' }), true)
+  assert.equal(options.admin.condition({}, { fieldType: 'radio' }), true)
+  assert.equal(options.admin.condition({}, { fieldType: 'checkbox' }), false)
+
+  function assertNativeFields(items) {
+    for (const field of items) {
+      assert.notEqual(field.virtual, true)
+      assert.notEqual(field.type, 'json')
+      assert.notEqual(field.type, 'richText')
+      if (field.fields) assertNativeFields(field.fields)
+    }
+  }
+  assertNativeFields(definitionFields.fields)
+  assertNativeFields(entryValues.fields)
+  assert.ok(!entry.fields.some(({ name }) => name === 'customFields'))
+
+  const { client } = payload.db
+  const { rows: tables } = await client.execute(
+    "SELECT name FROM sqlite_schema WHERE type = 'table'",
+  )
+  const names = tables.map(({ name }) => name)
+  assert.ok(names.includes('collection_definitions_fields'))
+  assert.ok(names.includes('collection_entries_values'))
+  assert.ok(!names.some((name) => /^dynamic_collection_|^dynamic_global_/.test(name)))
+  if (names.includes('payload_kv')) {
+    const { rows } = await client.execute('SELECT count(*) AS rows FROM payload_kv')
+    assert.equal(Number(rows[0].rows), 0, 'Application data must stay out of the core KV table')
+  }
+  const { rows: columnRows } = await client.execute('PRAGMA table_info(collection_entries_values)')
+  const columns = Object.fromEntries(columnRows.map(({ name, type }) => [name, type]))
+  assert.match(columns.field_key, /^TEXT$/i)
+  assert.match(columns.number_value, /^(?:REAL|NUMERIC)$/i)
+  assert.match(columns.text_value, /^TEXT$/i)
+  assert.match(columns.checkbox_value, /^INTEGER$/i)
+
+  const { rows: nativeIndexes } = await client.execute(`
+    SELECT columns.name FROM pragma_index_list('collection_entries_values') AS indexes
+    JOIN pragma_index_info(indexes.name) AS columns
+    GROUP BY indexes.name HAVING count(*) = 1
+  `)
+  const singleColumnIndexes = new Set(nativeIndexes.map(({ name }) => name))
+  assert.ok(singleColumnIndexes.has('date_value'))
+  assert.ok(singleColumnIndexes.has('select_value'))
+
+  const indexName = 'collection_values_key_number_parent_idx'
+  const { rows: indexColumns } = await client.execute(`PRAGMA index_info(${indexName})`)
+  assert.deepEqual(
+    indexColumns.map(({ name }) => name),
+    ['field_key', 'number_value', '_parent_id'],
+  )
+  const { rows: plan } = await client.execute({
+    sql: 'EXPLAIN QUERY PLAN SELECT _parent_id FROM collection_entries_values WHERE field_key = ? AND number_value >= ?',
+    args: ['capacity', 100],
+  })
+  assert.ok(
+    plan.some(({ detail }) => detail.includes(`COVERING INDEX ${indexName}`)),
+    JSON.stringify(plan),
+  )
+  const { rows: version } = await client.execute('PRAGMA schema_version')
+  return version[0].schema_version
+}
+
+async function verifyTypedStorage({ payload, manager, anonymous, outsider }) {
+  const schemaVersion = await assertNativeStorage(payload)
+  await anonymous('GET', definitions, 403)
+  await outsider('POST', definitions, 403, { title: 'Private', slug: 'private', fields })
+
+  const venues = await createDefinition(manager, 'Venues', 'venues', fields)
+  const other = await createDefinition(manager, 'Other venues', 'other-venues', [capacity])
+  const created = await createEntry(manager, 'North', venues.id, [
+    { fieldKey: 'capacity', numberValue: 120.5 },
+    { fieldKey: 'note', textareaValue: 'On the ground floor' },
+    { fieldKey: 'contact', emailValue: 'venue@example.test' },
+  ])
+  assert.equal(value(created, 'capacity', 'numberValue'), 120.5)
+  assert.equal(value(created, 'address', 'textValue'), 'North wing')
+  assert.equal(value(created, 'parking', 'numberValue'), 0)
+  assert.equal(value(created, 'open', 'checkboxValue'), false)
+  assert.equal(value(created, 'tier', 'selectValue'), 'standard')
+  assert.equal(value(created, 'opens', 'dateValue'), day)
+  assert.equal(value(created, 'note', 'textareaValue'), 'On the ground floor')
+  assert.equal(value(created, 'contact', 'emailValue'), 'venue@example.test')
+
+  const entryPath = `${entries}/${created.id}?depth=0`
+  await outsider('GET', entryPath, 403)
+  await outsider('PATCH', entryPath, 403, { title: 'Writer with the wrong role' })
+  const { doc: renamed } = await manager('PATCH', entryPath, 200, { title: 'Renamed' })
+  assert.equal(renamed.title, 'Renamed')
+  assert.deepEqual(
+    renamed.values,
+    created.values,
+    'A title update must preserve values and row IDs',
+  )
+  const otherMatch = await createEntry(manager, 'South', venues.id, [
+    { fieldKey: 'capacity', numberValue: 100 },
+  ])
+  await createEntry(manager, 'Parking only', venues.id, [
+    { fieldKey: 'capacity', numberValue: 60 },
+    { fieldKey: 'parking', numberValue: 200 },
+  ])
+  await createEntry(manager, 'Different definition', other.id, [
+    { fieldKey: 'capacity', numberValue: 200 },
+  ])
+  const filter = new URLSearchParams({
+    depth: '0',
+    limit: '1',
+    sort: 'id',
+    'where[and][0][definition][equals]': String(venues.id),
+    'where[and][1][values.fieldKey][equals]': 'capacity',
+    'where[and][2][values.numberValue][greater_than_equal]': '100',
+  })
+  const firstPage = await manager('GET', `${entries}?${filter}`, 200)
+  assert.deepEqual(
+    firstPage.docs.map(({ id }) => id),
+    [created.id],
+  )
+  assert.equal(firstPage.totalDocs, 2)
+  filter.set('page', '2')
+  const secondPage = await manager('GET', `${entries}?${filter}`, 200)
+  assert.deepEqual(
+    secondPage.docs.map(({ id }) => id),
+    [otherMatch.id],
+  )
+  assert.equal(secondPage.totalDocs, 2)
+
+  const { rows: stored } = await payload.db.client.execute({
+    sql: 'SELECT number_value, typeof(number_value) AS type, text_value FROM collection_entries_values WHERE _parent_id = ? AND field_key = ?',
+    args: [created.id, 'capacity'],
+  })
+  assert.deepEqual({ ...stored[0] }, { number_value: 120.5, type: 'real', text_value: null })
+  assert.equal(
+    await assertNativeStorage(payload),
+    schemaVersion,
+    'Adding schema documents needs no DDL',
+  )
+  await manager('DELETE', entryPath, 200)
+  await manager('GET', entryPath, 404)
+}
+
+async function verifyValidation({ manager }) {
+  const makeBadDefinition = (slug, invalidFields) =>
+    manager('POST', definitions, 400, { title: 'Invalid', slug, fields: invalidFields })
+  await makeBadDefinition('Bad_slug', fields)
+  await makeBadDefinition('duplicate-field', [capacity, capacity])
+  await makeBadDefinition('inverted-range', [{ ...capacity, min: 10, max: 1 }])
+  await makeBadDefinition('unknown-default', [{ ...fields.at(-1), defaultOption: 'unknown' }])
+  const date = { key: 'starts', label: 'Starts', fieldType: 'date' }
+  await makeBadDefinition('malformed-default-date', [{ ...date, defaultDate: '12' }])
+  await makeBadDefinition('impossible-default-date', [{ ...date, defaultDate: '2026-02-30' }])
+  const unused = await createDefinition(manager, 'Draft schema', 'draft-schema', [capacity])
+  const textCapacity = { key: 'capacity', label: 'Capacity', fieldType: 'text' }
+  const { doc: changed } = await manager('PATCH', `${definitions}/${unused.id}`, 200, {
+    fields: [textCapacity],
+  })
+  assert.equal(changed.fields[0].fieldType, 'text')
+  await manager('DELETE', `${definitions}/${unused.id}`, 200)
+
+  const venues = await createDefinition(manager, 'Validation venues', 'validation-venues', fields)
+  await makeBadDefinition('validation-venues', fields)
+  await manager('PATCH', `${definitions}/${venues.id}`, 409, { slug: 'changed' })
+
+  const validCapacity = { fieldKey: 'capacity', numberValue: 150 }
+  const bad = (input) =>
+    manager('POST', entries, 400, { title: 'Invalid', definition: venues.id, values: input })
+  await bad([])
+  await bad([{ fieldKey: 'capacity', numberValue: true }])
+  await bad([{ fieldKey: 'capacity', numberValue: 501 }])
+  await bad([validCapacity, { fieldKey: 'address', textValue: 'x' }])
+  await bad([validCapacity, { fieldKey: 'contact', emailValue: 'invalid' }])
+  await bad([validCapacity, { fieldKey: 'tier', selectValue: 'unknown' }])
+  await bad([validCapacity, { fieldKey: 'open', checkboxValue: 1 }])
+  await bad([validCapacity, { fieldKey: 'parking', textValue: 'wrong stored column' }])
+  await bad([validCapacity, { fieldKey: 'unknown', numberValue: 50 }])
+  await bad([validCapacity, validCapacity])
+
+  const venue = await createEntry(manager, 'Venue', venues.id, [validCapacity])
+  await manager('PATCH', `${definitions}/${venues.id}`, 409, {
+    fields: fields.map((field) => (field.key === 'capacity' ? textCapacity : field)),
+  })
+  await manager('DELETE', `${definitions}/${venues.id}`, 409)
+  const rooms = await createDefinition(manager, 'Rooms', 'rooms', [capacity])
+  await manager('PATCH', `${entries}/${venue.id}?depth=0`, 200, { definition: rooms.id })
+  assert.equal((await manager('GET', `${entries}/${venue.id}?depth=0`, 200)).definition, venues.id)
+}
+
+async function verifyAdditionalFieldTypes({ payload, manager, outsider }) {
+  const radio = {
+    key: 'publish_state',
+    label: '  ',
+    fieldType: 'radio',
+    options: [
+      { label: 'Draft', value: 'draft' },
+      { label: 'Public', value: 'public' },
+    ],
+    defaultOption: 'draft',
+  }
+  const code = {
+    key: 'source_code',
+    fieldType: 'code',
+    maxLength: 40,
+    defaultText: 'return 1;',
+  }
+  const slug = {
+    key: 'public-slug',
+    label: 'URL segment',
+    fieldType: 'slug',
+    defaultText: 'First Page',
+  }
+  const group = {
+    key: 'layout',
+    fieldType: 'group',
+    fields: [
+      { key: 'width', fieldType: 'number', required: true },
+      {
+        key: 'tags',
+        fieldType: 'array',
+        fields: [{ key: 'tag', fieldType: 'text', required: true }],
+      },
+    ],
+  }
+  const array = {
+    key: 'sections',
+    fieldType: 'array',
+    minRows: 1,
+    maxRows: 2,
+    fields: [{ key: 'heading', fieldType: 'text', required: true }],
+  }
+  const tabs = {
+    key: 'settings',
+    fieldType: 'tabs',
+    fields: [
+      {
+        key: 'general',
+        fieldType: 'group',
+        fields: [{ key: 'summary', fieldType: 'textarea', required: true }],
+      },
+      {
+        key: 'advanced',
+        fieldType: 'group',
+        fields: [{ key: 'visible', fieldType: 'checkbox', defaultChecked: true }],
+      },
+    ],
+  }
+  const blocks = {
+    key: 'content',
+    fieldType: 'blocks',
+    maxRows: 2,
+    fields: [
+      {
+        key: 'hero',
+        fieldType: 'group',
+        fields: [{ key: 'headline', fieldType: 'text', required: true }],
+      },
+      {
+        key: 'quote',
+        label: 'Quotation',
+        fieldType: 'group',
+        fields: [{ key: 'caption', fieldType: 'textarea', required: true }],
+      },
+    ],
+  }
+  const schema = [code, radio, slug, group, array, tabs, blocks]
+  const pages = await createDefinition(manager, 'Pages', 'pages', schema)
+  const persisted = await manager('GET', `${definitions}/${pages.id}?depth=0`, 200)
+  assert.deepEqual(
+    persisted.fields.slice(0, 3).map(({ label }) => label),
+    ['Source Code', 'Publish State', 'URL segment'],
+  )
+  assert.equal(persisted.fields[3].fields[1].fields[0].label, 'Tag')
+  assert.equal(persisted.fields[6].fields[1].label, 'Quotation')
+
+  const nested = (fieldKey, rows) => ({ fieldKey, rows })
+  const row = (...items) => ({ items })
+  const width = (numberValue) => ({ fieldKey: 'width', numberValue })
+  const heading = (textValue) => ({ fieldKey: 'heading', textValue })
+  const layout = nested('layout', [
+    row(width(960), nested('tags', [row({ fieldKey: 'tag', textValue: 'featured' })])),
+  ])
+  const sections = nested('sections', [row(heading('Introduction')), row(heading('Details'))])
+  const settings = nested('settings', [
+    row(
+      nested('general', [row({ fieldKey: 'summary', textareaValue: 'A short introduction' })]),
+      nested('advanced', [row()]),
+    ),
+  ])
+  const hero = { ...row({ fieldKey: 'headline', textValue: 'A real headline' }), blockKey: 'hero' }
+  const quote = {
+    ...row({ fieldKey: 'caption', textareaValue: 'First line\nSecond line' }),
+    blockKey: 'quote',
+  }
+  const content = nested('content', [hero, quote])
+  const input = [layout, sections, settings, content]
+  const {
+    rows: [{ schema_version: before }],
+  } = await payload.db.client.execute('PRAGMA schema_version')
+  const page = await createEntry(manager, 'First page', pages.id, input)
+  const pagePath = `${entries}/${page.id}?depth=0`
+  const loaded = await manager('GET', pagePath, 200)
+  assert.deepEqual(loaded.values, page.values)
+  await outsider('GET', pagePath, 403)
+  assert.equal(valueRow(loaded.values, code.key).fieldLabel, 'Source Code')
+  assert.equal(value(loaded, code.key, 'textareaValue'), 'return 1;')
+  assert.equal(value(loaded, radio.key, 'selectValue'), 'draft')
+  assert.equal(value(loaded, slug.key, 'textValue'), 'first-page')
+  const layoutItems = value(loaded, group.key, 'rows')[0].items
+  assert.equal(nestedValue(layoutItems, 'width', 'numberValue'), 960)
+  assert.equal(
+    nestedValue(nestedValue(layoutItems, 'tags', 'rows')[0].items, 'tag', 'textValue'),
+    'featured',
+  )
+  const storedSections = value(loaded, array.key, 'rows')
+  assert.deepEqual(
+    storedSections.map(({ items }) => nestedValue(items, 'heading', 'textValue')),
+    ['Introduction', 'Details'],
+  )
+  const tabItems = value(loaded, tabs.key, 'rows')[0].items
+  const general = nestedValue(tabItems, 'general', 'rows')[0].items
+  const advanced = nestedValue(tabItems, 'advanced', 'rows')[0].items
+  assert.equal(nestedValue(general, 'summary', 'textareaValue'), 'A short introduction')
+  assert.equal(nestedValue(advanced, 'visible', 'checkboxValue'), true)
+  const storedBlocks = value(loaded, blocks.key, 'rows')
+  assert.deepEqual(
+    storedBlocks.map(({ blockKey }) => blockKey),
+    ['hero', 'quote'],
+  )
+  assert.equal(nestedValue(storedBlocks[0].items, 'headline', 'textValue'), 'A real headline')
+  assert.equal(
+    nestedValue(storedBlocks[1].items, 'caption', 'textareaValue'),
+    'First line\nSecond line',
+  )
+
+  const { doc: renamed } = await manager('PATCH', pagePath, 200, { title: 'Renamed page' })
+  assert.deepEqual(
+    renamed.values,
+    loaded.values,
+    'A title-only update preserves nested IDs and values',
+  )
+  const values = loaded.values.map((field) => {
+    if (field.fieldKey === array.key) return { ...field, rows: [...storedSections].reverse() }
+    if (field.fieldKey === blocks.key) return { ...field, rows: [...storedBlocks].reverse() }
+    if (field.fieldKey === code.key) return { ...field, textareaValue: 'return 2;\n' }
+    if (field.fieldKey === radio.key) return { ...field, selectValue: 'public' }
+    if (field.fieldKey === slug.key) return { ...field, textValue: 'Second Page' }
+    return field
+  })
+  const { doc: updated } = await manager('PATCH', pagePath, 200, { values })
+  assert.equal(value(updated, code.key, 'textareaValue'), 'return 2;\n')
+  assert.equal(value(updated, radio.key, 'selectValue'), 'public')
+  assert.equal(value(updated, slug.key, 'textValue'), 'second-page')
+  assert.deepEqual(value(updated, array.key, 'rows'), [...storedSections].reverse())
+  assert.deepEqual(value(updated, blocks.key, 'rows'), [...storedBlocks].reverse())
+  assert.deepEqual((await manager('GET', pagePath, 200)).values, updated.values)
+
+  const {
+    rows: [{ schema_version: after }],
+  } = await payload.db.client.execute('PRAGMA schema_version')
+  assert.equal(after, before, 'Using nested collection types needs no DDL per definition or entry')
+
+  const badDefinition = (slug, fields) =>
+    manager('POST', definitions, 400, { title: 'Invalid', slug, fields })
+  await badDefinition('bad-label', [{ ...code, label: 42 }])
+  await badDefinition('bad-radio-default', [{ ...radio, defaultOption: 'unknown' }])
+  await badDefinition('duplicate-nested-keys', [
+    { ...group, fields: [group.fields[0], group.fields[0]] },
+  ])
+  await badDefinition('bad-array-limits', [{ ...array, minRows: 3 }])
+  await badDefinition('bad-block-definition', [{ ...blocks, fields: [code] }])
+  await badDefinition('bad-tab-definition', [{ ...tabs, fields: [code] }])
+  await badDefinition('too-deep', [{ ...group, fields: [{ ...group, fields: [array] }] }])
+  await manager('PATCH', `${definitions}/${pages.id}`, 409, {
+    fields: schema.map((field) =>
+      field.key === group.key ? { ...field, fields: [{ key: 'width', fieldType: 'text' }] } : field,
+    ),
+  })
+
+  const badEntry = (values) =>
+    manager('POST', entries, 400, { title: 'Invalid page', definition: pages.id, values })
+  const replacing = (key, replacement) =>
+    input.map((value) => (value.fieldKey === key ? replacement : value))
+  await badEntry([...input, { fieldKey: code.key, textareaValue: 'x'.repeat(41) }])
+  await badEntry([...input, { fieldKey: radio.key, selectValue: 'unknown' }])
+  await badEntry([...input, { fieldKey: slug.key, textareaValue: 'wrong typed column' }])
+  await badEntry(replacing(group.key, nested('layout', [row()])))
+  await badEntry(replacing(group.key, nested('layout', [row(width(960)), row(width(1024))])))
+  await badEntry(replacing(array.key, nested('sections', [])))
+  await badEntry(
+    replacing(
+      array.key,
+      nested('sections', [row(heading('1')), row(heading('2')), row(heading('3'))]),
+    ),
+  )
+  await badEntry(replacing(array.key, nested('sections', [storedSections[0], storedSections[0]])))
+  await badEntry(replacing(blocks.key, nested('content', [{ ...hero, blockKey: 'unknown' }])))
+  await badEntry(replacing(blocks.key, nested('content', [{ ...hero, blockKey: 'quote' }])))
+}
+
+async function verifyReferences({ payload, manager, user }, routes = { definitions, entries }) {
+  const { definitions, entries } = routes
+  const define = (title, slug, fields) =>
+    createDefinition(manager, title, slug, fields, definitions)
+  const create = (title, definition, values) =>
+    createEntry(manager, title, definition, values, entries)
+  const venues = await define('Reference venues', 'reference-venues', [capacity])
+  const north = await create('North', venues.id, [{ fieldKey: 'capacity', numberValue: 1 }])
+  const south = await create('South', venues.id, [{ fieldKey: 'capacity', numberValue: 2 }])
+  const east = await create('East', venues.id, [{ fieldKey: 'capacity', numberValue: 3 }])
+  const reviews = await define('Reviews', 'reviews', [
+    {
+      key: 'venue',
+      label: 'Venue',
+      fieldType: 'relationship',
+      targetDefinition: venues.id,
+      required: true,
+    },
+    {
+      key: 'nearby',
+      label: 'Nearby',
+      fieldType: 'relationship',
+      targetDefinition: venues.id,
+      hasMany: true,
+    },
+    { key: 'asset', label: 'Asset', fieldType: 'upload' },
+  ])
+  const file = Buffer.from('Temporary native collection fixture\n')
+  const media = await payload.create({
+    collection: 'media',
+    overrideAccess: false,
+    user,
+    data: {},
+    file: { name: 'fixture.txt', mimetype: 'text/plain', data: file, size: file.length },
+  })
+  const review = await create('Review', reviews.id, [
+    { fieldKey: 'venue', relationshipValue: north.id },
+    { fieldKey: 'nearby', relationshipValues: [east.id, south.id] },
+    { fieldKey: 'asset', uploadValue: media.id },
+  ])
+  assert.equal(value(review, 'venue', 'relationshipValue'), north.id)
+  assert.deepEqual(value(review, 'nearby', 'relationshipValues'), [east.id, south.id])
+  assert.equal(value(review, 'asset', 'uploadValue'), media.id)
+  await manager('POST', entries, 400, {
+    title: 'Wrong target',
+    definition: reviews.id,
+    values: [{ fieldKey: 'venue', relationshipValue: review.id }],
+  })
+  await manager('POST', entries, 400, {
+    title: 'Wrong cardinality',
+    definition: reviews.id,
+    values: [
+      { fieldKey: 'venue', relationshipValue: north.id },
+      { fieldKey: 'nearby', relationshipValue: south.id },
+    ],
+  })
+  await manager('DELETE', `${entries}/${north.id}`, 409)
+  await manager('DELETE', `${entries}/${south.id}`, 409)
+  await manager('DELETE', `/api/media/${media.id}`, 409)
+  const preserved = await manager('GET', `${entries}/${review.id}?depth=0`, 200)
+  assert.equal(value(preserved, 'venue', 'relationshipValue'), north.id)
+  assert.deepEqual(value(preserved, 'nearby', 'relationshipValues'), [east.id, south.id])
+  assert.equal(value(preserved, 'asset', 'uploadValue'), media.id)
+
+  const nestedReviews = await define('Nested reviews', 'nested-reviews', [
+    {
+      key: 'attachments',
+      fieldType: 'group',
+      fields: [
+        {
+          key: 'assets',
+          fieldType: 'array',
+          fields: [
+            { key: 'site', fieldType: 'relationship', targetDefinition: venues.id, hasMany: true },
+            { key: 'files', fieldType: 'upload', hasMany: true },
+          ],
+        },
+      ],
+    },
+  ])
+  const nestedValues = (id) => [
+    {
+      fieldKey: 'attachments',
+      rows: [
+        {
+          items: [
+            {
+              fieldKey: 'assets',
+              rows: [
+                {
+                  items: [
+                    { fieldKey: 'site', relationshipValues: [id] },
+                    { fieldKey: 'files', uploadValues: [media.id] },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ]
+  await manager('POST', entries, 400, {
+    title: 'Wrong nested target',
+    definition: nestedReviews.id,
+    values: nestedValues(review.id),
+  })
+  const nestedReview = await create('Nested review', nestedReviews.id, nestedValues(north.id))
+  const nestedPath = `${entries}/${nestedReview.id}?depth=0`
+  const nestedResult = await manager('GET', nestedPath, 200)
+  const assets = value(nestedResult, 'attachments', 'rows')[0].items
+  const references = nestedValue(assets, 'assets', 'rows')[0].items
+  assert.deepEqual(nestedValue(references, 'site', 'relationshipValues'), [north.id])
+  assert.deepEqual(nestedValue(references, 'files', 'uploadValues'), [media.id])
+  await manager('DELETE', `${entries}/${review.id}`, 200)
+  await manager('DELETE', `${entries}/${north.id}`, 409)
+  await manager('DELETE', `/api/media/${media.id}`, 409)
+  await manager('DELETE', nestedPath, 200)
+
+  await manager('DELETE', `${entries}/${north.id}`, 200)
+  await manager('DELETE', `${entries}/${south.id}`, 200)
+  await manager('DELETE', `/api/media/${media.id}`, 200)
+
+  await manager('PATCH', `${definitions}/${venues.id}`, 200, {
+    fields: [
+      capacity,
+      { key: 'related', label: 'Related', fieldType: 'relationship', targetDefinition: venues.id },
+    ],
+  })
+  const eastPath = `${entries}/${east.id}?depth=0`
+  const { doc: selfLinked } = await manager('PATCH', eastPath, 200, {
+    values: [
+      { fieldKey: 'capacity', numberValue: 3 },
+      { fieldKey: 'related', relationshipValue: east.id },
+    ],
+  })
+  assert.equal(value(selfLinked, 'related', 'relationshipValue'), east.id)
+  await manager('DELETE', eastPath, 200)
+  await manager('GET', eastPath, 404)
+  await manager('DELETE', `${definitions}/${reviews.id}`, 200)
+  await manager('DELETE', `${definitions}/${venues.id}`, 409)
+  await manager('DELETE', `${definitions}/${nestedReviews.id}`, 200)
+  await manager('DELETE', `${definitions}/${venues.id}`, 200)
+}
+
+async function verifyLocalAPI({ payload, user }) {
+  const req = await createPayloadRequest({ payload, user })
+  const withRequest = { req, overrideAccess: false, depth: 0 }
+  const definition = await payload.create({
+    ...withRequest,
+    collection: definitionSlug,
+    data: {
+      title: 'Local venues',
+      slug: 'local-venues',
+      fields: [{ ...capacity, defaultNumber: 1 }],
+    },
+  })
+  const createVenue = (title) =>
+    payload.create({
+      ...withRequest,
+      collection: entrySlug,
+      data: { title, definition: definition.id },
+    })
+  const first = await createVenue('Before schema update')
+  assert.equal(value(first, 'capacity', 'numberValue'), 1)
+  await payload.update({
+    ...withRequest,
+    collection: definitionSlug,
+    id: definition.id,
+    data: { fields: [{ ...capacity, defaultNumber: 2 }] },
+  })
+  const second = await createVenue('After schema update')
+  assert.equal(value(second, 'capacity', 'numberValue'), 2)
+
+  const privileged = { overrideAccess: true, depth: 0 }
+  const notes = await payload.create({
+    ...privileged,
+    collection: definitionSlug,
+    data: {
+      title: 'Local notes',
+      slug: 'local-notes',
+      fields: [
+        {
+          key: 'venue',
+          label: 'Venue',
+          fieldType: 'relationship',
+          targetDefinition: definition.id,
+        },
+      ],
+    },
+  })
+  const createNote = (related) =>
+    payload.create({
+      ...privileged,
+      collection: entrySlug,
+      data: {
+        title: 'Privileged note',
+        definition: notes.id,
+        values: [{ fieldKey: 'venue', relationshipValue: related }],
+      },
+    })
+  const note = await createNote(first.id)
+  assert.equal(value(note, 'venue', 'relationshipValue'), first.id)
+  const updated = await payload.update({
+    ...privileged,
+    collection: entrySlug,
+    id: note.id,
+    data: { values: [{ fieldKey: 'venue', relationshipValue: second.id }] },
+  })
+  assert.equal(value(updated, 'venue', 'relationshipValue'), second.id)
+  await assert.rejects(createNote(note.id), { status: 400 })
+}
+
+async function verifyUnsupportedPostgresFields({ payload, manager, user }) {
+  for (const fieldType of ['json', 'richText']) {
+    const data = {
+      title: 'Unsupported field',
+      slug: `unsupported-${fieldType.toLowerCase()}`,
+      fields: [{ key: 'content', fieldType }],
+    }
+    await manager('POST', definitions, 400, data)
+    await assert.rejects(
+      payload.create({ collection: definitionSlug, data, overrideAccess: false, user }),
+      { status: 400 },
+    )
+  }
+}
+
+function lexicalDocument(text) {
+  const block = { direction: null, format: '', indent: 0, version: 1 }
+  return {
+    root: {
+      ...block,
+      type: 'root',
+      children: [
+        {
+          ...block,
+          type: 'paragraph',
+          textFormat: 0,
+          textStyle: '',
+          children: text
+            ? [{ detail: 0, format: 0, mode: 'normal', style: '', text, type: 'text', version: 1 }]
+            : [],
+        },
+      ],
+    },
+  }
+}
+
+async function verifyPostgresFields({
+  payload,
+  manager,
+  outsider,
+  outsiderUser,
+  schemaName,
+  user,
+}) {
+  const definitionField = namedField(payload.collections[definitionSlug].config.fields, 'fields')
+  const types = namedField(definitionField.fields, 'fieldType').options
+  assert.ok(types.some(({ label, value }) => label === 'JSON' && value === 'json'))
+  assert.ok(types.some(({ label, value }) => label === 'Rich Text' && value === 'richText'))
+  const valueFields = namedField(payload.collections[entrySlug].config.fields, 'values').fields
+  assert.equal(namedField(valueFields, 'jsonValue').type, 'json')
+  assert.equal(namedField(valueFields, 'richTextValue').type, 'richText')
+
+  const { rows: columns } = await payload.db.pool.query(
+    `SELECT table_name, column_name, data_type FROM information_schema.columns
+     WHERE table_schema = $1 AND table_name IN ('collection_entries_values', 'collection_entry_items_1')
+       AND column_name IN ('json_value', 'rich_text_value')
+     ORDER BY table_name, column_name`,
+    [schemaName],
+  )
+  assert.deepEqual(
+    columns.map(({ table_name, column_name, data_type }) => [table_name, column_name, data_type]),
+    [
+      ['collection_entries_values', 'json_value', 'jsonb'],
+      ['collection_entries_values', 'rich_text_value', 'jsonb'],
+      ['collection_entry_items_1', 'json_value', 'jsonb'],
+      ['collection_entry_items_1', 'rich_text_value', 'jsonb'],
+    ],
+  )
+
+  const documentFields = [
+    { key: 'metadata', fieldType: 'json', required: true },
+    { key: 'body', fieldType: 'richText', required: true },
+    {
+      key: 'details',
+      fieldType: 'group',
+      fields: [
+        { key: 'extra', fieldType: 'json' },
+        { key: 'note', fieldType: 'richText' },
+      ],
+    },
+  ]
+  const local = { user, overrideAccess: false, depth: 0 }
+  const definitionsData = { title: 'Content', slug: 'content', fields: documentFields }
+  const definition = await payload.create({
+    ...local,
+    collection: definitionSlug,
+    data: definitionsData,
+  })
+  const scope = await manager('GET', `${definitions}/${definition.id}?depth=0`, 200)
+  assert.deepEqual(
+    scope.fields.map(({ fieldType }) => fieldType),
+    ['json', 'richText', 'group'],
+  )
+
+  const data = {
+    metadata: { numbers: [0, 1], nested: { flag: false, clear: null } },
+    body: lexicalDocument('Created using Local API'),
+    extra: 0,
+    note: lexicalDocument('Nested document'),
+  }
+  const emptyLexical = lexicalDocument('')
+  const valueRows = ({ metadata, body, extra, note }) => [
+    { fieldKey: 'metadata', jsonValue: metadata },
+    { fieldKey: 'body', richTextValue: body },
+    {
+      fieldKey: 'details',
+      rows: [
+        {
+          items: [
+            { fieldKey: 'extra', jsonValue: extra },
+            { fieldKey: 'note', richTextValue: note },
+          ],
+        },
+      ],
+    },
+  ]
+  const readDocument = (entry) => {
+    const { items } = value(entry, 'details', 'rows')[0]
+    return {
+      metadata: value(entry, 'metadata', 'jsonValue'),
+      body: value(entry, 'body', 'richTextValue'),
+      extra: nestedValue(items, 'extra', 'jsonValue'),
+      note: nestedValue(items, 'note', 'richTextValue'),
+    }
+  }
+
+  const created = await payload.create({
+    ...local,
+    collection: entrySlug,
+    data: { title: 'Created locally', definition: definition.id, values: valueRows(data) },
+  })
+  const path = `${entries}/${created.id}?depth=0`
+  assert.deepEqual(readDocument(await manager('GET', path, 200)), data)
+  await outsider('GET', path, 403)
+  await outsider('PATCH', path, 403, { values: valueRows(data) })
+  await assert.rejects(
+    payload.findByID({ ...local, user: outsiderUser, collection: entrySlug, id: created.id }),
+    { status: 403 },
+  )
+
+  const changed = {
+    metadata: ['updated', { active: true }],
+    body: lexicalDocument('Updated using REST API'),
+    extra: false,
+    note: emptyLexical,
+  }
+  await manager('PATCH', path, 200, { values: valueRows(changed) })
+  const read = () => payload.findByID({ ...local, collection: entrySlug, id: created.id })
+  assert.deepEqual(readDocument(await read()), changed)
+
+  const { doc: renamed } = await manager('PATCH', path, 200, { title: 'Only the title changed' })
+  assert.deepEqual(readDocument(renamed), changed)
+
+  const restCreated = await createEntry(
+    manager,
+    'Created using REST',
+    definition.id,
+    valueRows(data),
+  )
+  const withEmptyString = { ...data, metadata: '{"keep":"string"}', extra: '' }
+  await payload.update({
+    ...local,
+    collection: entrySlug,
+    id: restCreated.id,
+    data: { values: valueRows(withEmptyString) },
+  })
+  const restPath = `${entries}/${restCreated.id}?depth=0`
+  assert.deepEqual(readDocument(await manager('GET', restPath, 200)), withEmptyString)
+
+  const jsonLookingStrings = { ...data, metadata: 'true', extra: '[0,1]' }
+  await manager('PATCH', path, 200, { values: valueRows(jsonLookingStrings) })
+  assert.deepEqual(readDocument(await read()), jsonLookingStrings)
+
+  await manager('PATCH', path, 400, {
+    values: valueRows({ ...data, body: { text: 'Not Lexical' } }),
+  })
+  await manager('PATCH', path, 400, { values: valueRows({ ...data, body: null }) })
+  await manager('PATCH', path, 400, { values: valueRows({ ...data, body: emptyLexical }) })
+  for (const children of [
+    [],
+    [{ type: 'unknown', version: 1 }],
+    data.body.root.children[0].children,
+    [{ ...data.body.root.children[0], $slots: { aside: { type: 'unknown', version: 1 } } }],
+  ]) {
+    await manager('PATCH', path, 400, {
+      values: valueRows({ ...data, note: { root: { ...data.body.root, children } } }),
+    })
+  }
+  await manager('PATCH', path, 400, { values: valueRows({ ...data, metadata: undefined }) })
+  await assert.rejects(
+    payload.update({
+      ...local,
+      collection: entrySlug,
+      id: created.id,
+      data: { values: valueRows({ ...data, metadata: { invalid: 1n } }) },
+    }),
+    { status: 400 },
+  )
+  await manager('PATCH', path, 400, {
+    values: [{ fieldKey: 'metadata', richTextValue: data.body }, ...valueRows(data).slice(1)],
+  })
+  await manager('PATCH', path, 400, {
+    values: [
+      { fieldKey: 'metadata', jsonValue: data.metadata, jsonEditorInvalid: true },
+      ...valueRows(data).slice(1),
+    ],
+  })
+  assert.deepEqual(readDocument(await read()), jsonLookingStrings)
+
+  await payload.delete({ ...local, collection: entrySlug, id: created.id })
+  await manager('GET', path, 404)
+  await manager('DELETE', restPath, 200)
+  await assert.rejects(payload.findByID({ ...local, collection: entrySlug, id: restCreated.id }), {
+    status: 404,
+  })
+}
+
+test('the native plugin works on a clean SQLite installation', async (t) => {
+  await withFixture(async (fixture) => {
+    await t.test('saves typed array fields and filters a numeric row in its collection', () =>
+      verifyTypedStorage(fixture),
+    )
+    await t.test('rejects invalid configurations and submitted values', () =>
+      verifyValidation(fixture),
+    )
+    await t.test('omits PostgreSQL-only field types from the SQLite APIs', () =>
+      verifyUnsupportedPostgresFields(fixture),
+    )
+    await t.test('round-trips code, radio, slug, and nested fields with native arrays', () =>
+      verifyAdditionalFieldTypes(fixture),
+    )
+    await t.test('uses typed relationships and uploads with configured targets', () =>
+      verifyReferences(fixture),
+    )
+    await t.test(
+      'updates the schema within a shared request and honors explicit Local API access override',
+      () => verifyLocalAPI(fixture),
+    )
+  })
+})
+
+const postgresURL = process.env.TEST_DATABASE_URL
+
+for (const [adapter, url] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `custom slugs and labels work with host collections on ${adapter}`,
+    { skip: adapter === 'PostgreSQL' && !url },
+    () =>
+      withFixture(
+        async (fixture) => {
+          const { payload, manager, outsider, user } = fixture
+          const definitions = '/api/content-types'
+          const entries = '/api/content-records'
+
+          assert.deepEqual(payload.collections['content-types'].config.labels, {
+            singular: 'Content type',
+            plural: 'Content types',
+          })
+          assert.deepEqual(payload.collections['content-records'].config.labels, {
+            singular: 'Record',
+            plural: 'Entries',
+          })
+          assert.ok(payload.db.rawTables.collection_definitions)
+          assert.ok(payload.db.rawTables.collection_entries_values)
+          await manager('GET', '/api/collections', 200)
+          await manager('GET', '/api/entries', 200)
+          await outsider('GET', definitions, 403)
+          await outsider('GET', entries, 403)
+
+          const definition = await payload.create({
+            collection: 'content-types',
+            overrideAccess: false,
+            user,
+            data: { title: 'Rooms', slug: 'rooms', fields: [capacity] },
+          })
+          const room = await createEntry(
+            manager,
+            'Lobby',
+            definition.id,
+            [{ fieldKey: 'capacity', numberValue: 25 }],
+            entries,
+          )
+          const found = await payload.findByID({
+            collection: 'content-records',
+            id: room.id,
+            depth: 0,
+            overrideAccess: false,
+            user,
+          })
+          assert.equal(found.definition, definition.id)
+          assert.equal(value(found, 'capacity', 'numberValue'), 25)
+          await manager('DELETE', `${definitions}/${definition.id}`, 409)
+          await verifyReferences(fixture, { definitions, entries })
+        },
+        url,
+        {
+          collections: {
+            slug: 'content-types',
+            labels: { singular: 'Content type', plural: 'Content types' },
+          },
+          entries: { slug: 'content-records', labels: { singular: 'Record' } },
+        },
+        [
+          { slug: 'collections', fields: [] },
+          { slug: 'entries', fields: [] },
+        ],
+      ),
+  )
+}
+
+test(
+  'JSON and Rich Text work in PostgreSQL through the Local and REST APIs',
+  { skip: !postgresURL },
+  () => withFixture(verifyPostgresFields, postgresURL),
+)

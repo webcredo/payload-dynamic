@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/knip/schema.json",
+  "treatConfigHintsAsErrors": true,
+  "entry": [
+    "src/payload-dynamic/index.ts",
+    "src/payload-dynamic/react.ts",
+    "src/payload-dynamic/CollectionsNavigation.tsx",
+    "tests/*.mjs",
+    "scripts/*.mjs"
+  ]
+}

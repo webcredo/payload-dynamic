@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src/payload-dynamic",
+    "outDir": "dist",
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "incremental": false,
+    "allowJs": false,
+    "plugins": []
+  },
+  "include": ["src/payload-dynamic/**/*.ts", "src/payload-dynamic/**/*.tsx"],
+  "exclude": ["node_modules", "dist"]
+}

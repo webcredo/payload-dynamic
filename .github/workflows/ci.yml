@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: payload_test
+          POSTGRES_USER: payload_test
+          POSTGRES_PASSWORD: payload_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U payload_test -d payload_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run test:collections
+        env:
+          TEST_DATABASE_URL: postgres://payload_test:payload_test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/payload_test
+      - run: npm run build
+      - run: npm run test:package
+      - run: npm run dev:build
+        env:
+          PAYLOAD_SECRET: ci-only-disposable-database-secret
+          DATABASE_URL: postgres://payload_test:payload_test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/payload_test
+          DATABASE_PUSH: "1"
