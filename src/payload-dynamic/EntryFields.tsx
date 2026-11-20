@@ -22,7 +22,7 @@ import type { ArrayFieldClientProps, TextareaFieldClientProps, TextFieldClientPr
 import { createContext, useContext, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { CollectionBreadcrumb } from './CollectionBreadcrumb'
 import type { DefinitionField } from './definitions'
-import { defaultValue, referenceID, valueColumn } from './entry-values'
+import { defaultValue, hasStoredValue, referenceID, valueColumn } from './entry-values'
 
 type Definition = { fields: DefinitionField[]; title: string }
 type LoadResult = ({ id: string } & Definition) | { id: string; error: true }
@@ -376,7 +376,7 @@ export function EntryFields({
 }: ArrayFieldClientProps & { definitionSlug: string; entrySlug: string }) {
   const { config } = useConfig()
   const editDepth = useEditDepth()
-  const { addFieldRow, getDataByPath, removeFieldRow } = useForm()
+  const { addFieldRow, dispatchFields, getDataByPath, removeFieldRow, setModified } = useForm()
   const definition = useFormFields(([state]) => referenceID(state.definition?.value))
   const id = definition === undefined ? undefined : String(definition)
   const selected = useRef<string | undefined>(undefined)
@@ -412,10 +412,42 @@ export function EntryFields({
           return
 
         if (!readOnly) {
+          const existing =
+            getDataByPath<({ fieldKey: string } & Record<string, unknown>)[]>(path) ?? []
+          const byKey = new Map(schema.fields.map((field) => [field.key, field]))
+          for (let rowIndex = existing.length - 1; rowIndex >= 0; rowIndex--) {
+            const row = existing[rowIndex]
+            if (!byKey.has(row.fieldKey) && !hasStoredValue(row)) {
+              removeFieldRow({ path, rowIndex })
+            }
+          }
+          const retained = existing.filter((row) => byKey.has(row.fieldKey) || hasStoredValue(row))
+          let metadataChanged = false
+          for (const [index, row] of retained.entries()) {
+            const field = byKey.get(row.fieldKey)
+            if (!field || hasStoredValue(row)) continue
+            // Empty rows survive a type change in SQL. Refresh their metadata so
+            // native input conditions render the new type when opening the form.
+            for (const [name, value] of Object.entries({
+              fieldType: field.fieldType,
+              fieldLabel: field.label,
+              fieldMany: Boolean(field.hasMany),
+            })) {
+              if (row[name] === value) continue
+              metadataChanged = true
+              dispatchFields({
+                type: 'UPDATE',
+                path: `${path}.${index}.${name}`,
+                value,
+                valid: true,
+              })
+            }
+          }
+          if (metadataChanged) setModified(true)
           addMissingValues({
             addFieldRow,
             fields: schema.fields,
-            existing: getDataByPath(path) ?? [],
+            existing: retained,
             path,
             schemaPath,
           })
@@ -432,12 +464,14 @@ export function EntryFields({
     api,
     attempt,
     definitionSlug,
+    dispatchFields,
     getDataByPath,
     id,
     path,
     readOnly,
     removeFieldRow,
     schemaPath,
+    setModified,
   ])
 
   const current = result?.id === id ? result : undefined

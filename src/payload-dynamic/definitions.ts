@@ -10,7 +10,8 @@ import {
 } from 'payload'
 import { slugify, toWords } from 'payload/shared'
 import type { CollectionSlugs } from './entry-list'
-import { normalizeDate } from './entry-values'
+import { hasStoredValue, normalizeDate } from './entry-values'
+import { lockDefinition } from './schema-transaction'
 
 const fieldTypeOptions = [
   { label: 'Text', value: 'text' },
@@ -350,6 +351,83 @@ async function hasEntries(req: PayloadRequest, entrySlug: CollectionSlug, id: ID
   return totalDocs > 0
 }
 
+function fieldConflict(field: DefinitionField, reason: string): never {
+  throw new APIError(`${field.label} (${field.key}): ${reason}`, 409)
+}
+
+async function assertSafeFieldChanges(
+  req: PayloadRequest,
+  entrySlug: CollectionSlug,
+  id: ID,
+  previous: DefinitionField[],
+  current: DefinitionField[],
+  synchronized: boolean,
+) {
+  if (!(await hasEntries(req, entrySlug, id))) return
+  const byKey = new Map(current.map((field) => [field.key, field]))
+  const changed = previous.filter((field) => !preservesField(field, byKey.get(field.key)))
+  for (const field of changed) {
+    const next = byKey.get(field.key)
+    if (
+      field.required ||
+      structureTypes.includes(field.fieldType) ||
+      (next &&
+        (next.required ||
+          structureTypes.includes(next.fieldType) ||
+          next.fieldType === field.fieldType))
+    ) {
+      throw new APIError(
+        'Field keys, types and relationship settings cannot change while the collection has entries.',
+        409,
+      )
+    }
+  }
+  if (!changed.length) return
+  if (!synchronized) {
+    throw new APIError(
+      'Field keys, types and relationship settings cannot change while the collection has entries.',
+      409,
+    )
+  }
+
+  // Read complete value rows: independent array predicates cannot prove that a
+  // key and every populated column belong to the same row on both adapters.
+  // Keyset pagination bounds each read and uses the caller's transaction, while
+  // overrideAccess prevents a manager's read filter from hiding populated entries.
+  let after: ID | undefined
+  while (true) {
+    const { docs } = await req.payload.find({
+      collection: entrySlug,
+      req,
+      overrideAccess: true,
+      depth: 0,
+      select: { values: true },
+      limit: 100,
+      pagination: false,
+      sort: 'id',
+      where: {
+        definition: { equals: id },
+        ...(after === undefined ? {} : { id: { greater_than: after } }),
+      },
+    })
+    for (const doc of docs) {
+      const rows = ('values' in doc && Array.isArray(doc.values) ? doc.values : []) as ({
+        fieldKey: string
+      } & Record<string, unknown>)[]
+      for (const field of changed) {
+        if (rows.some((row) => row.fieldKey === field.key && hasStoredValue(row))) {
+          fieldConflict(
+            field,
+            'Clear its values in every entry before removing or changing its type.',
+          )
+        }
+      }
+    }
+    if (docs.length < 100) return
+    after = docs[docs.length - 1].id
+  }
+}
+
 function fieldDefinitions(
   options: (typeof fieldTypeOptions)[number][],
   definitionSlug: CollectionSlug,
@@ -554,16 +632,36 @@ export function definitionCollection({
           if (data.fields === undefined) return data
           const fields = await normalizeFields(data.fields, req, types)
 
-          if (
-            operation === 'update' &&
-            originalDoc &&
-            !preservesFields((originalDoc.fields ?? []) as DefinitionField[], fields) &&
-            (await hasEntries(req, entrySlug, originalDoc.id))
-          ) {
-            throw new APIError(
-              'Field keys, types and relationship settings cannot change while the collection has entries.',
-              409,
-            )
+          if (operation === 'update' && originalDoc) {
+            const synchronized = await lockDefinition(req, originalDoc.id)
+            if (synchronized) {
+              const latest = await req.payload.findByID({
+                collection: definitionSlug,
+                id: originalDoc.id,
+                req,
+                depth: 0,
+                overrideAccess: true,
+                showHiddenFields: true,
+              })
+              const latestFields =
+                'fields' in latest && Array.isArray(latest.fields) ? latest.fields : []
+              if (JSON.stringify(latestFields) !== JSON.stringify(originalDoc.fields ?? [])) {
+                throw new APIError(
+                  'The collection definition changed. Reload it before saving.',
+                  409,
+                )
+              }
+            }
+            if (!preservesFields((originalDoc.fields ?? []) as DefinitionField[], fields)) {
+              await assertSafeFieldChanges(
+                req,
+                entrySlug,
+                originalDoc.id,
+                (originalDoc.fields ?? []) as DefinitionField[],
+                fields,
+                synchronized,
+              )
+            }
           }
           return { ...data, fields }
         },

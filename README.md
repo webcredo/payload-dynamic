@@ -44,7 +44,7 @@ Install the beta from npm.
 npm install payload-dynamic@beta
 ```
 
-If the npm beta tag is not available yet, install the tarball from the [GitHub prerelease](https://github.com/webcredo/payload-dynamic/releases/tag/v0.1.0), or install a local copy with `npm install ./payload-dynamic-0.1.0.tgz`.
+If the npm beta tag is not available yet, install the tarball from the [GitHub prerelease](https://github.com/webcredo/payload-dynamic/releases/tag/v0.1.1), or install a local copy with `npm install ./payload-dynamic-0.1.1.tgz`.
 
 ### Build a tarball from source
 
@@ -88,7 +88,10 @@ const signedIn: Access = ({ req }) => Boolean(req.user)
 
 export default buildConfig({
   secret: process.env.PAYLOAD_SECRET!,
-  db: sqliteAdapter({ client: { url: process.env.DATABASE_URL ?? 'file:./payload.db' } }),
+  db: sqliteAdapter({
+    client: { url: process.env.DATABASE_URL ?? 'file:./payload.db' },
+    transactionOptions: {},
+  }),
   collections: [{ slug: 'users', auth: true, fields: [] }],
   plugins: [payloadDynamic({ canManage: signedIn })],
 })
@@ -206,7 +209,9 @@ The plugin indexes field keys, numeric values, dates, and choice values. It also
 
 ### Migrations
 
-Existing records can prevent incompatible changes to field definitions. Plan data migration and backup before changing a field type or removing a field in use.
+An optional top-level leaf field can be removed or changed to another optional leaf type after its values have been cleared in **every** entry. The server returns `409` with the field label and key while any stored value remains, including `0`, `false`, JSON objects/arrays, or values in an old column. Existing empty rows remain editable after the change; values are never coerced or migrated. Required fields, nested structure changes, and relationship-setting changes still need a separate data migration.
+
+These changes require an active Payload adapter transaction. PostgreSQL uses the same definition row lock for schema changes and entry writes. For SQLite, configure `sqliteAdapter({ client: { url: 'file:./payload.db' }, transactionOptions: {} })` to enable its write transactions. Without an active transaction, the existing conservative `409` guard remains in place while entries exist; ordinary entry updates and compatible schema edits keep working. Checks use paginated reads in the request's transaction and do not clean up stored data. Stale schema drafts or entry values are rejected so callers can reload and retry. Direct database writes bypass these protections.
 
 For production, keep schema push disabled. Use `payload migrate:create` to generate the migration, review its SQL and indexes against a copy of the database, then apply it with `payload migrate`.
 

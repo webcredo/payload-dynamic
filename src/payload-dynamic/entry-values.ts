@@ -43,13 +43,28 @@ const valueColumns = {
   richText: 'richTextValue',
 } satisfies Record<FieldType, string>
 
-export const allValueColumns = [
+const allValueColumns = [
   ...new Set(Object.values(valueColumns)),
   'relationshipValues',
   'uploadValues',
 ]
 
-export function valueColumn({ fieldType, hasMany }: DefinitionField) {
+// Match normalization's empty scalar/reference values, without treating false,
+// zero, JSON strings/collections, or nested rows as absent.
+export function hasStoredValue(row: Record<string, unknown>, exceptColumn?: string) {
+  if (row[invalidJSONDraftKey] === true) return true
+  return allValueColumns.some((column) => {
+    const value = row[column]
+    if (column === exceptColumn || value == null) return false
+    if (column === 'jsonValue' || column === 'richTextValue') return true
+    return value !== '' && (!Array.isArray(value) || value.length > 0)
+  })
+}
+
+export function valueColumn({
+  fieldType,
+  hasMany,
+}: Pick<DefinitionField, 'fieldType' | 'hasMany'>) {
   if (hasMany && fieldType === 'relationship') return 'relationshipValues'
   if (hasMany && fieldType === 'upload') return 'uploadValues'
   return valueColumns[fieldType]
