@@ -15,7 +15,7 @@ export default buildConfig({
   admin: { user: 'users', importMap: { baseDir: configDir } },
   db: /^postgres(?:ql)?:\/\//.test(databaseURL)
     ? postgresAdapter({ pool: { connectionString: databaseURL }, push })
-    : sqliteAdapter({ client: { url: databaseURL }, push }),
+    : sqliteAdapter({ client: { url: databaseURL }, push, transactionOptions: {} }),
   graphQL: { disable: true },
   telemetry: false,
   typescript: { autoGenerate: false, outputFile: join(configDir, 'payload-types.ts') },

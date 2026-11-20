@@ -20,8 +20,8 @@ import {
 } from './definitions'
 import { type CollectionSlugs, entryDefinitionParam } from './entry-list'
 import {
-  allValueColumns,
   defaultValue,
+  hasStoredValue,
   type ID,
   invalidJSONDraftKey,
   normalizeDate,
@@ -29,6 +29,7 @@ import {
   valueColumn,
 } from './entry-values'
 import { normalizePostgresValue, postgresValueFields } from './postgres-fields'
+import { lockDefinition } from './schema-transaction'
 
 const entryAdminComponents = {
   arrayField: 'payload-dynamic/react#EntryFields',
@@ -333,6 +334,16 @@ function entryHooks({
     operation: Operation,
   ): Promise<ValueRow[]> {
     const previous = new Map(previousRows.map((row) => [row.fieldKey, row]))
+    const byKey = new Map(fields.map((field) => [field.key, field]))
+    for (const row of previousRows) {
+      const field = byKey.get(row.fieldKey)
+      if ((!field || row.fieldType !== field.fieldType) && hasStoredValue(row)) {
+        throw new APIError(
+          `${row.fieldLabel ?? row.fieldKey} (${row.fieldKey}): Stored values no longer match the collection. Restore the field definition before editing this entry.`,
+          409,
+        )
+      }
+    }
     const input = value === undefined ? previousRows : value
     if (!Array.isArray(input)) throw new APIError('Values must be an array.', 400)
     const rows = new Map<string, ValueRow>()
@@ -354,13 +365,20 @@ function entryHooks({
         throw new APIError(`${field.label}: Enter valid JSON.`, 400)
       }
       if (
-        row &&
-        allValueColumns.some((key) => {
-          const value = row[key]
-          const emptyArray = Array.isArray(value) && value.length === 0
-          return key !== column && value != null && (key === 'jsonValue' || !emptyArray)
-        })
+        row?.fieldType != null &&
+        row.fieldType !== field.fieldType &&
+        valueColumn({
+          fieldType: row.fieldType as FieldType,
+          hasMany: Boolean(row.fieldMany),
+        }) === column &&
+        hasStoredValue(row)
       ) {
+        throw new APIError(
+          `${field.label} (${field.key}): The field type changed. Reload the entry before saving.`,
+          409,
+        )
+      }
+      if (row && hasStoredValue(row, column)) {
         throw new APIError(`Use the ${field.fieldType} value for ${field.label}.`, 400)
       }
       const submitted = row?.[column]
@@ -389,7 +407,14 @@ function entryHooks({
         [column]: normalized,
       })
     }
-    if (rows.size) throw new APIError('A value refers to a field outside this collection.', 400)
+    for (const row of rows.values()) {
+      const old = previous.get(row.fieldKey)
+      // Only a genuinely persisted, empty legacy row may be discarded. Unknown
+      // submitted keys (even null ones) and filled stale rows remain errors.
+      if (!old?.id || row.id !== old.id || hasStoredValue(old) || hasStoredValue(row)) {
+        throw new APIError('A value refers to a field outside this collection.', 400)
+      }
+    }
     return values
   }
 
@@ -406,6 +431,21 @@ function entryHooks({
     const id = data.definition === undefined ? previousID : referenceID(data.definition)
     if (id === undefined || (previousID !== undefined && String(id) !== String(previousID))) {
       throw new APIError('Choose a collection when creating an entry. It cannot be changed.', 400)
+    }
+    const synchronized = await lockDefinition(req, id)
+    if (synchronized && originalDoc?.id !== undefined) {
+      const latest = await req.payload.findByID({
+        collection: entrySlug,
+        id: originalDoc.id,
+        req,
+        depth: 0,
+        overrideAccess: true,
+        showHiddenFields: true,
+      })
+      const latestValues = 'values' in latest && Array.isArray(latest.values) ? latest.values : []
+      if (JSON.stringify(latestValues) !== JSON.stringify(originalDoc.values ?? [])) {
+        throw new APIError('The entry values changed. Reload the entry before saving.', 409)
+      }
     }
     const schema = await readSchema(req, definitionSlug, id, overrideAccess)
     if (!schema) throw new APIError('Collection definition is unavailable.', 400)

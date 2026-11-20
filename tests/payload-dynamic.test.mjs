@@ -12,6 +12,7 @@ import { payloadDynamic } from '../src/payload-dynamic/index.ts'
 
 process.env.DISABLE_PAYLOAD_HMR = 'true'
 process.env.PAYLOAD_DROP_DATABASE = 'false'
+process.env.PAYLOAD_FORCE_DRIZZLE_PUSH = 'true'
 
 const definitionSlug = 'collections'
 const entrySlug = 'entries'
@@ -72,7 +73,13 @@ async function request({ config, key, token }, method, path, status, body) {
   return result
 }
 
-async function withFixture(run, postgresURL, pluginOptions, hostCollections = []) {
+async function withFixture(
+  run,
+  postgresURL,
+  pluginOptions,
+  hostCollections = [],
+  sqliteTransactions = false,
+) {
   const dir = await mkdtemp(join(tmpdir(), 'payload-dynamic-test-'))
   const dbURL = pathToFileURL(join(dir, 'db.sqlite')).href
   const key = randomUUID()
@@ -90,7 +97,11 @@ async function withFixture(run, postgresURL, pluginOptions, hostCollections = []
           push: true,
           schemaName,
         })
-      : sqliteAdapter({ client: { url: dbURL }, push: true }),
+      : sqliteAdapter({
+          client: { url: dbURL },
+          push: true,
+          ...(sqliteTransactions ? { transactionOptions: {} } : {}),
+        }),
     graphQL: { disable: true },
     logger: { options: { level: 'fatal' } },
     telemetry: false,
@@ -1065,6 +1076,261 @@ test('the native plugin works on a clean SQLite installation', async (t) => {
 })
 
 const postgresURL = process.env.TEST_DATABASE_URL
+
+async function verifyEmptyFieldEvolution({ payload, manager }) {
+  const keep = { key: 'keep', label: 'Keep', fieldType: 'text' }
+  const amount = { key: 'amount', label: 'Amount', fieldType: 'text' }
+  const obsolete = { key: 'obsolete', label: 'Obsolete', fieldType: 'text' }
+  const definition = await createDefinition(manager, 'Evolution', 'evolution', [
+    keep,
+    amount,
+    obsolete,
+  ])
+  const definitionPath = `${definitions}/${definition.id}?depth=0`
+  const path = (entry) => `${entries}/${entry.id}?depth=0`
+  const docs = []
+  for (const [index, populated] of [true, false, true].entries()) {
+    docs.push(
+      await createEntry(manager, `Entry ${index}`, definition.id, [
+        { fieldKey: 'keep', textValue: `Preserve ${index}` },
+        { fieldKey: 'amount', textValue: populated ? '123' : null },
+        { fieldKey: 'obsolete', textValue: populated ? 'Old note' : null },
+      ]),
+    )
+  }
+  const number = { ...amount, fieldType: 'number' }
+  const blocked = async (fields, field) => {
+    const error = await manager('PATCH', definitionPath, 409, { fields })
+    assert.ok(JSON.stringify(error).includes(field.key))
+    assert.ok(JSON.stringify(error).includes(field.label))
+  }
+  const denyBoth = async (field, alternative) => {
+    await blocked([keep, alternative], field)
+    await blocked([keep], field)
+  }
+  const clear = async (entry) =>
+    manager('PATCH', path(entry), 200, {
+      values: entry.values.map((row) =>
+        row.fieldKey === 'keep' ? row : { ...row, textValue: null },
+      ),
+    })
+  for (const cleared of [undefined, docs[0]]) {
+    if (cleared) await clear(cleared)
+    await blocked([keep, number, obsolete], amount)
+    await blocked([keep, amount], obsolete)
+  }
+  await clear(docs[2])
+  await manager('PATCH', definitionPath, 409, {
+    fields: [keep, { ...number, required: true, defaultNumber: 1 }, obsolete],
+  })
+  await manager('PATCH', definitionPath, 200, { fields: [keep, number] })
+
+  // GET still contains empty SQL legacy rows. Both a normal form submission and
+  // a title-only PATCH must safely reconcile them, preserving unrelated values/IDs.
+  for (const [index, entry] of docs.entries()) {
+    const loaded = await manager('GET', path(entry), 200)
+    assert.equal(value(loaded, 'amount', 'textValue'), null)
+    assert.equal(value(loaded, 'obsolete', 'textValue'), null)
+    if (index === 1) {
+      const old = valueRow(loaded.values, 'obsolete')
+      await manager('PATCH', path(entry), 400, {
+        values: [...loaded.values, { fieldKey: 'unknown' }],
+      })
+      await manager('PATCH', path(entry), 400, {
+        values: loaded.values.map((row) => (row === old ? { ...row, id: randomUUID() } : row)),
+      })
+      await manager('PATCH', path(entry), 400, {
+        values: loaded.values.map((row) => (row === old ? { ...row, textValue: 'Spoofed' } : row)),
+      })
+      await manager('PATCH', path(entry), 400, {
+        values: loaded.values.map((row) =>
+          row === old ? { ...row, jsonEditorInvalid: true } : row,
+        ),
+      })
+    }
+    // A same-ID API row may inherit old hidden metadata from Payload. A value
+    // supplied in the new column must still be accepted without fieldType.
+    const submitted = loaded.values.map((row) =>
+      index === 2 && row.fieldKey === 'amount'
+        ? { id: row.id, fieldKey: row.fieldKey, numberValue: 17 }
+        : row,
+    )
+    const { doc: saved } = await manager(
+      'PATCH',
+      path(entry),
+      200,
+      index === 0 ? { title: 'Title only' } : { values: submitted },
+    )
+    assert.equal(value(saved, 'keep', 'textValue'), `Preserve ${index}`)
+    assert.equal(valueRow(saved.values, 'keep').id, valueRow(entry.values, 'keep').id)
+    assert.equal(valueRow(saved.values, 'amount').id, valueRow(entry.values, 'amount').id)
+    assert.equal(valueRow(saved.values, 'amount').fieldType, 'number')
+    assert.equal(value(saved, 'amount', 'numberValue'), index === 2 ? 17 : null)
+    assert.ok(!saved.values.some(({ fieldKey }) => fieldKey === 'obsolete'))
+    if (index === 2) {
+      await manager('PATCH', path(entry), 200, {
+        values: saved.values.map((row) =>
+          row.fieldKey === 'amount' ? { ...row, numberValue: null } : row,
+        ),
+      })
+    }
+  }
+  await manager('POST', entries, 400, {
+    title: 'Unknown empty key',
+    definition: definition.id,
+    values: [{ fieldKey: 'obsolete', textValue: null }],
+  })
+
+  const types = [
+    'text',
+    'textarea',
+    'code',
+    'slug',
+    'email',
+    'date',
+    'select',
+    'radio',
+    'relationship',
+    'upload',
+  ]
+  if (payload.db.name === 'postgres') types.push('json', 'richText')
+  for (const fieldType of types) {
+    const field = {
+      ...amount,
+      fieldType,
+      ...(['select', 'radio'].includes(fieldType)
+        ? { options: [{ label: 'One', value: 'one' }] }
+        : {}),
+      ...(fieldType === 'relationship' ? { targetDefinition: definition.id } : {}),
+    }
+    await manager('PATCH', definitionPath, 200, { fields: [keep, field] })
+    const { doc } = await manager('PATCH', path(docs[0]), 200, { title: `Empty ${fieldType}` })
+    assert.equal(valueRow(doc.values, 'amount').fieldType, fieldType)
+    if (fieldType === 'slug') {
+      await manager('PATCH', path(docs[0]), 409, {
+        values: doc.values.map((row) =>
+          row.fieldKey === 'amount' ? { ...row, fieldType: 'text', textValue: 'Stale Text' } : row,
+        ),
+      })
+      assert.equal(value(await manager('GET', path(docs[0]), 200), 'amount', 'textValue'), null)
+      const { doc: fresh } = await manager('PATCH', path(docs[0]), 200, {
+        values: [
+          { fieldKey: 'keep', textValue: 'Preserve 0' },
+          { fieldKey: 'amount', textValue: 'Fresh Slug' },
+        ],
+      })
+      assert.equal(value(fresh, 'amount', 'textValue'), 'fresh-slug')
+      await manager('PATCH', path(docs[0]), 200, {
+        values: fresh.values.map((row) =>
+          row.fieldKey === 'amount' ? { ...row, textValue: null } : row,
+        ),
+      })
+    }
+    if (fieldType === 'relationship') {
+      await manager('PATCH', definitionPath, 409, { fields: [keep, { ...field, hasMany: true }] })
+    }
+    const values =
+      fieldType === 'json'
+        ? [0, false, '', {}, [], [null]]
+        : fieldType === 'richText'
+          ? [lexicalDocument('')]
+          : []
+    for (const stored of values) {
+      const column = fieldType === 'json' ? 'jsonValue' : 'richTextValue'
+      const { doc: filled } = await manager('PATCH', path(docs[0]), 200, {
+        values: [
+          { fieldKey: 'keep', textValue: 'Preserve 0' },
+          { fieldKey: 'amount', [column]: stored },
+        ],
+      })
+      await denyBoth(field, number)
+      await manager('PATCH', path(docs[0]), 200, {
+        values: filled.values.map((row) =>
+          row.fieldKey === 'amount' ? { ...row, [column]: null } : row,
+        ),
+      })
+    }
+  }
+  await manager('PATCH', definitionPath, 200, { fields: [keep, number] })
+  const { doc: zero } = await manager('PATCH', path(docs[0]), 200, {
+    values: [
+      { fieldKey: 'keep', textValue: 'Preserve 0' },
+      { fieldKey: 'amount', numberValue: 0 },
+    ],
+  })
+  await denyBoth(number, amount)
+  await manager('PATCH', path(docs[0]), 200, {
+    values: zero.values.map((row) =>
+      row.fieldKey === 'amount' ? { ...row, numberValue: null } : row,
+    ),
+  })
+
+  // Seed old-column/nested legacy data through the adapter, bypassing entry
+  // validation only in this fixture. Schema checks must inspect every column.
+  const empty = await manager('GET', path(docs[0]), 200)
+  const seed = (rows) =>
+    payload.db.updateOne({ collection: entrySlug, id: empty.id, data: { values: rows } })
+  for (const legacy of [
+    { textValue: 'An old value' },
+    {
+      rows: [
+        {
+          id: randomUUID(),
+          items: [
+            {
+              id: randomUUID(),
+              fieldKey: 'child',
+              fieldLabel: 'Child',
+              fieldType: 'text',
+              textValue: 'Nested',
+            },
+          ],
+        },
+      ],
+    },
+  ]) {
+    await seed(empty.values.map((row) => (row.fieldKey === 'amount' ? { ...row, ...legacy } : row)))
+    await denyBoth(number, amount)
+    await seed(empty.values)
+  }
+
+  const checkbox = { ...amount, fieldType: 'checkbox' }
+  await manager('PATCH', definitionPath, 200, { fields: [keep, checkbox] })
+  await manager('PATCH', path(docs[0]), 200, {
+    values: [
+      { fieldKey: 'keep', textValue: 'Preserve 0' },
+      { fieldKey: 'amount', checkboxValue: false },
+    ],
+  })
+  await denyBoth(checkbox, amount)
+}
+
+for (const [adapter, url] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `empty optional leaf fields can evolve safely on ${adapter}`,
+    { skip: adapter === 'PostgreSQL' && !url },
+    () => withFixture(verifyEmptyFieldEvolution, url, undefined, [], true),
+  )
+}
+
+test('SQLite without adapter transactions keeps destructive schema edits fail-closed', () =>
+  withFixture(async ({ manager }) => {
+    const keep = { key: 'keep', label: 'Keep', fieldType: 'text' }
+    const field = { key: 'empty', label: 'Empty', fieldType: 'text' }
+    const definition = await createDefinition(manager, 'No transactions', 'no-transactions', [
+      keep,
+      field,
+    ])
+    const entry = await createEntry(manager, 'Empty entry', definition.id, [])
+    await manager('PATCH', `${definitions}/${definition.id}`, 409, { fields: [keep] })
+    await manager('PATCH', `${definitions}/${definition.id}`, 409, {
+      fields: [keep, { ...field, fieldType: 'number' }],
+    })
+    await manager('PATCH', `${entries}/${entry.id}`, 200, { title: 'Ordinary updates still work' })
+  }))
 
 for (const [adapter, url] of [
   ['SQLite', undefined],
