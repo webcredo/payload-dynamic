@@ -79,3 +79,15 @@ test('enabled plugin rejects duplicate, conflicting, invalid, and reserved slugs
     assert.throws(() => payloadDynamic({ canManage, entries: { slug } })(config), message)
   }
 })
+
+test('workspace mode requires an existing host collection', async () => {
+  const { payloadDynamic } = await import(manifest.name)
+  const plugin = payloadDynamic({
+    canManage: () => true,
+    workspace: { collection: 'teams', allowedIDs: () => [] },
+  })
+  assert.throws(
+    () => plugin({ collections: [] }),
+    /workspace must be an existing Payload collection/,
+  )
+})

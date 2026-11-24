@@ -10,6 +10,7 @@ import {
   type Config,
   type Plugin,
 } from 'payload'
+import type { PayloadDynamicAccess, PayloadDynamicWorkspace } from './access'
 import { definitionCollection, definitionDepth } from './definitions'
 import { entryCollection, entryValueReferences } from './entries'
 
@@ -101,7 +102,23 @@ const preventReferencedUploadDeletion =
     if (totalDocs) throw new APIError('Remove references to this file before deleting it.', 409)
   }
 
+const preventReferencedWorkspaceDeletion =
+  (definitionSlug: CollectionSlug): CollectionBeforeDeleteHook =>
+  async ({ id, req }) => {
+    const { totalDocs } = await req.payload.count({
+      collection: definitionSlug,
+      overrideAccess: true,
+      req,
+      where: { workspace: { equals: id } },
+    })
+    if (totalDocs)
+      throw new APIError('Delete its dynamic collections before deleting this workspace.', 409)
+  }
+
+export type { PayloadDynamicAccess, PayloadDynamicWorkspace } from './access'
+
 type CollectionOverrides = {
+  access?: PayloadDynamicAccess
   slug?: string
   labels?: CollectionConfig['labels']
 }
@@ -111,6 +128,7 @@ export type PayloadDynamicOptions = {
   enabled?: boolean
   canManage: Access
   uploadCollection?: CollectionSlug
+  workspace?: PayloadDynamicWorkspace
   collections?: CollectionOverrides
   entries?: CollectionOverrides
 }
@@ -165,6 +183,7 @@ function validateCollectionSlugs(config: Config, definitionSlug: string, entrySl
 export function payloadDynamic({
   canManage,
   uploadCollection,
+  workspace,
   collections: definitionOptions,
   entries: entryOptions,
   enabled = true,
@@ -182,35 +201,45 @@ export function payloadDynamic({
       throw new Error('The configured upload target must be a Payload upload collection.')
     }
 
+    if (workspace && !collections.some(({ slug }) => slug === workspace.collection)) {
+      throw new Error('The configured workspace must be an existing Payload collection.')
+    }
+
     const slugs = { definitionSlug, entrySlug }
     const options = {
       ...slugs,
       canManage,
       postgres: config.db.name === 'postgres',
       uploadCollection,
+      workspace,
     }
-    const hosts = uploadCollection
-      ? collections.map((collection) =>
-          collection.slug === uploadCollection
-            ? {
-                ...collection,
-                hooks: {
-                  ...collection.hooks,
-                  beforeDelete: [
-                    preventReferencedUploadDeletion(entrySlug),
-                    ...(collection.hooks?.beforeDelete ?? []),
-                  ],
-                },
-              }
-            : collection,
-        )
-      : collections
+    const hosts = collections.map((collection) => {
+      const guards: CollectionBeforeDeleteHook[] = []
+      if (collection.slug === uploadCollection)
+        guards.push(preventReferencedUploadDeletion(entrySlug))
+      if (collection.slug === workspace?.collection) {
+        guards.push(preventReferencedWorkspaceDeletion(definitionSlug))
+      }
+      return guards.length
+        ? {
+            ...collection,
+            hooks: {
+              ...collection.hooks,
+              beforeDelete: [...guards, ...(collection.hooks?.beforeDelete ?? [])],
+            },
+          }
+        : collection
+    })
     return {
       ...config,
       collections: [
         ...hosts,
-        definitionCollection({ ...options, labels: definitionOptions?.labels }),
-        entryCollection({ ...options, labels: entryOptions?.labels }),
+        definitionCollection({
+          ...options,
+          access: definitionOptions?.access,
+          labels: definitionOptions?.labels,
+        }),
+        entryCollection({ ...options, access: entryOptions?.access, labels: entryOptions?.labels }),
       ],
       admin: {
         ...config.admin,
