@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
   type Access,
   APIError,
@@ -9,8 +10,15 @@ import {
   validations,
 } from 'payload'
 import { slugify, toWords } from 'payload/shared'
+import {
+  dynamicAccess,
+  inheritDuplicateScope,
+  type PayloadDynamicAccess,
+  type PayloadDynamicWorkspace,
+  withinWorkspace,
+} from './access'
 import type { CollectionSlugs } from './entry-list'
-import { hasStoredValue, normalizeDate } from './entry-values'
+import { hasStoredValue, normalizeDate, referenceID } from './entry-values'
 import { lockDefinition } from './schema-transaction'
 
 const fieldTypeOptions = [
@@ -431,6 +439,7 @@ async function assertSafeFieldChanges(
 function fieldDefinitions(
   options: (typeof fieldTypeOptions)[number][],
   definitionSlug: CollectionSlug,
+  scoped: boolean,
   depth = 0,
 ): Field[] {
   const fields: Field[] = [
@@ -514,6 +523,12 @@ function fieldDefinitions(
       type: 'relationship',
       label: 'Target collection',
       relationTo: definitionSlug,
+      filterOptions: scoped
+        ? ({ data }) => {
+            const id = referenceID(data?.workspace)
+            return id === undefined ? true : { workspace: { equals: id } }
+          }
+        : undefined,
       admin: { condition: onlyFor('relationship') },
     },
     {
@@ -547,29 +562,56 @@ function fieldDefinitions(
       labels: { singular: 'Nested field', plural: 'Nested fields' },
       maxRows: maxDefinitionRows,
       admin: { condition: onlyFor(...structureTypes) },
-      fields: fieldDefinitions(options, definitionSlug, depth + 1),
+      fields: fieldDefinitions(options, definitionSlug, scoped, depth + 1),
     })
   }
   return fields
 }
 
+const validateWorkspace: typeof validations.relationship = (value, options) =>
+  validations.relationship(
+    value,
+    options.overrideAccess ? { ...options, filterOptions: () => true } : options,
+  )
+
 export function definitionCollection({
+  access,
   canManage,
   definitionSlug,
   entrySlug,
   labels,
   postgres,
   uploadCollection,
+  workspace,
 }: CollectionSlugs & {
+  access?: PayloadDynamicAccess
   canManage: Access
   labels?: CollectionConfig['labels']
   postgres: boolean
   uploadCollection?: string
+  workspace?: PayloadDynamicWorkspace
 }): CollectionConfig {
   const options = availableFieldTypes(postgres).filter(
     ({ value }) => value !== 'upload' || uploadCollection,
   )
   const types = new Set(options.map(({ value }) => value))
+
+  const workspaceFields: Field[] = workspace
+    ? [
+        {
+          name: 'workspace',
+          type: 'relationship' as const,
+          relationTo: workspace.collection,
+          required: true,
+          filterOptions: async ({ req }: { req: PayloadRequest }) => {
+            const ids = await workspace.allowedIDs(req)
+            return ids.length ? { id: { in: [...ids] } } : false
+          },
+          validate: validateWorkspace,
+          admin: { allowCreate: false, description: 'Fixed after the collection is created.' },
+        },
+      ]
+    : []
 
   return {
     slug: definitionSlug,
@@ -589,29 +631,48 @@ export function definitionCollection({
         },
       },
     },
-    access: { create: canManage, read: canManage, update: canManage, delete: canManage },
+    access: dynamicAccess(
+      canManage,
+      access,
+      workspace && {
+        path: 'workspace',
+        workspace,
+        canCreate: ({ data }, ids) => withinWorkspace(data?.workspace, ids),
+      },
+    ),
+    ...(workspace && { indexes: [{ fields: ['workspace', 'slug'], unique: true }] }),
     fields: [
       { name: 'title', type: 'text', required: true },
       {
         name: 'slug',
         type: 'text',
         required: true,
-        unique: true,
+        unique: !workspace,
         maxLength: 50,
+        ...(workspace && {
+          hooks: {
+            beforeDuplicate: [
+              ({ value }) =>
+                `${String(value).slice(0, 32)}-copy-${randomUUID().replaceAll('-', '').slice(0, 12)}`,
+            ],
+          },
+        }),
         admin: {
           description:
             'Use lowercase letters, numbers, hyphens or underscores. Fixed after creation.',
         },
       },
+      ...workspaceFields,
       {
         name: 'fields',
         type: 'array',
         required: true,
         maxRows: maxDefinitionRows,
-        fields: fieldDefinitions(options, definitionSlug),
+        fields: fieldDefinitions(options, definitionSlug, Boolean(workspace)),
       },
     ],
     hooks: {
+      ...(workspace && { beforeOperation: [inheritDuplicateScope('workspace')] }),
       beforeValidate: [
         async ({ data, operation, originalDoc, req }) => {
           if (!data) return data
@@ -627,6 +688,12 @@ export function definitionCollection({
             }
             if (operation === 'update' && originalDoc && data.slug !== originalDoc.slug) {
               throw new APIError('The slug is fixed after the collection is created.', 409)
+            }
+          }
+          if (workspace && data.workspace !== undefined && operation === 'update' && originalDoc) {
+            const previous = referenceID(originalDoc.workspace)
+            if (String(referenceID(data.workspace)) !== String(previous)) {
+              throw new APIError('The workspace is fixed after the collection is created.', 409)
             }
           }
           if (data.fields === undefined) return data
@@ -667,18 +734,30 @@ export function definitionCollection({
         },
       ],
       beforeChange: [
-        async ({ data, req }) => {
+        async ({ data, originalDoc, req }) => {
           const targetIDs = new Map<string, ID>()
           collectTargets((data.fields ?? []) as DefinitionField[], targetIDs)
           if (targetIDs.size > 0) {
+            const workspaceID = referenceID(data.workspace ?? originalDoc?.workspace)
+            if (workspace && workspaceID === undefined) {
+              throw new APIError('Choose a workspace for the collection.', 400)
+            }
             const { totalDocs } = await req.payload.count({
               collection: definitionSlug,
               overrideAccess: true,
               req,
-              where: { id: { in: [...targetIDs.values()] } },
+              where: {
+                id: { in: [...targetIDs.values()] },
+                ...(workspace && { workspace: { equals: workspaceID } }),
+              },
             })
             if (totalDocs !== targetIDs.size) {
-              throw new APIError('A target collection does not exist.', 400)
+              throw new APIError(
+                workspace
+                  ? 'A target collection does not exist in this workspace.'
+                  : 'A target collection does not exist.',
+                400,
+              )
             }
           }
           return data

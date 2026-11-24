@@ -13,6 +13,12 @@ import {
 } from 'payload'
 import { slugify } from 'payload/shared'
 import {
+  dynamicAccess,
+  inheritDuplicateScope,
+  type PayloadDynamicAccess,
+  type PayloadDynamicWorkspace,
+} from './access'
+import {
   availableFieldTypes,
   type DefinitionField,
   definitionDepth,
@@ -105,7 +111,10 @@ function readSchema(
     })
     .then((doc) =>
       doc && 'fields' in doc && Array.isArray(doc.fields)
-        ? (doc.fields as DefinitionField[])
+        ? {
+            fields: doc.fields as DefinitionField[],
+            workspaceID: 'workspace' in doc ? referenceID(doc.workspace) : undefined,
+          }
         : undefined,
     )
 }
@@ -114,7 +123,10 @@ function entryHooks({
   definitionSlug,
   entrySlug,
   uploadCollection,
-}: CollectionSlugs & { uploadCollection?: CollectionSlug }) {
+  scoped,
+}: CollectionSlugs & { uploadCollection?: CollectionSlug; scoped: boolean }) {
+  type Operation = { req: PayloadRequest; overrideAccess: boolean; workspaceID?: ID }
+
   // Native relationship controls ask for filters per row during one form-state request.
   const schemas = new WeakMap<PayloadRequest, Map<string, ReturnType<typeof readSchema>>>()
   function getPickerSchema(req: PayloadRequest, id: ID) {
@@ -139,19 +151,21 @@ function entryHooks({
       const row = siblingData as Partial<ValueRow> | undefined
       const path = depth === 0 ? row?.fieldKey : row?.fieldPath
       if (id === undefined || typeof path !== 'string') return false
-      const fields = await getPickerSchema(req, id)
-      const field = fields && findField(fields, path)
+      const schema = await getPickerSchema(req, id)
+      if (!schema || (scoped && schema.workspaceID === undefined)) return false
+      const field = findField(schema.fields, path)
       const target = referenceID(field?.targetDefinition)
-      return field?.fieldType === 'relationship' && target !== undefined
-        ? { definition: { equals: target } }
-        : false
+      if (field?.fieldType !== 'relationship' || target === undefined) return false
+      return {
+        definition: { equals: target },
+        ...(scoped && { 'definition.workspace': { equals: schema.workspaceID } }),
+      }
     }
 
   async function normalizeReference(
     field: DefinitionField,
     value: unknown,
-    req: PayloadRequest,
-    overrideAccess: boolean,
+    { req, overrideAccess, workspaceID }: Operation,
   ) {
     const list = field.hasMany ? value : [value]
     if (!Array.isArray(list) || list.length > 100) {
@@ -185,7 +199,10 @@ function entryHooks({
       select: { id: true },
       where: {
         id: { in: ids },
-        ...(field.fieldType === 'relationship' ? { definition: { equals: target } } : {}),
+        ...(field.fieldType === 'relationship' && {
+          definition: { equals: target },
+          ...(scoped && { 'definition.workspace': { equals: workspaceID } }),
+        }),
       },
     })
     if (docs.length !== ids.length) {
@@ -197,12 +214,7 @@ function entryHooks({
     return field.hasMany ? ids : ids[0]
   }
 
-  async function normalizeValue(
-    field: DefinitionField,
-    value: unknown,
-    req: PayloadRequest,
-    overrideAccess: boolean,
-  ) {
+  async function normalizeValue(field: DefinitionField, value: unknown, operation: Operation) {
     if (field.fieldType === 'json' || field.fieldType === 'richText') {
       return normalizePostgresValue(field.fieldType, value, {
         required: Boolean(field.required),
@@ -262,12 +274,10 @@ function entryHooks({
         break
       case 'relationship':
       case 'upload':
-        return normalizeReference(field, value, req, overrideAccess)
+        return normalizeReference(field, value, operation)
     }
     throw new APIError(`Enter a valid ${field.fieldType} for ${field.label}.`, 400)
   }
-
-  type Operation = { req: PayloadRequest; overrideAccess: boolean }
 
   async function normalizeRows(
     field: DefinitionField,
@@ -394,8 +404,7 @@ function entryHooks({
           : await normalizeValue(
               field,
               !previousRow && submitted === undefined ? defaultValue(field) : submitted,
-              operation.req,
-              operation.overrideAccess,
+              operation,
             )
       values.push({
         id: previousRow?.id,
@@ -448,8 +457,14 @@ function entryHooks({
       }
     }
     const schema = await readSchema(req, definitionSlug, id, overrideAccess)
-    if (!schema) throw new APIError('Collection definition is unavailable.', 400)
-    return normalizeValues(schema, value, originalDoc?.values ?? [], '', { req, overrideAccess })
+    if (!schema || (scoped && schema.workspaceID === undefined)) {
+      throw new APIError('Collection definition is unavailable.', 400)
+    }
+    return normalizeValues(schema.fields, value, originalDoc?.values ?? [], '', {
+      req,
+      overrideAccess,
+      workspaceID: schema.workspaceID,
+    })
   }
 
   return { prepareValues, filterReferences }
@@ -460,22 +475,27 @@ const validateRelationship: typeof validations.relationship = (value, options) =
   validations.relationship(value, { ...options, filterOptions: undefined })
 
 export function entryCollection({
+  access,
   canManage,
   definitionSlug,
   entrySlug,
   labels,
   postgres,
   uploadCollection,
+  workspace,
 }: CollectionSlugs & {
+  access?: PayloadDynamicAccess
   canManage: Access
   labels?: CollectionConfig['labels']
   postgres: boolean
   uploadCollection?: CollectionSlug
+  workspace?: PayloadDynamicWorkspace
 }): CollectionConfig {
   const { prepareValues, filterReferences } = entryHooks({
     definitionSlug,
     entrySlug,
     uploadCollection,
+    scoped: Boolean(workspace),
   })
   const fieldTypes = availableFieldTypes(postgres).map(({ value }) => value)
 
@@ -664,7 +684,26 @@ export function entryCollection({
         },
       },
     },
-    access: { create: canManage, read: canManage, update: canManage, delete: canManage },
+    access: dynamicAccess(
+      canManage,
+      access,
+      workspace && {
+        path: 'definition.workspace',
+        workspace,
+        canCreate: async ({ data, req }, ids) => {
+          const id =
+            data?.definition === undefined ? scopedDefinitionID(req) : referenceID(data.definition)
+          if (id === undefined) return false
+          const { totalDocs } = await req.payload.count({
+            collection: definitionSlug,
+            overrideAccess: true,
+            req,
+            where: { id: { equals: id }, workspace: { in: [...ids] } },
+          })
+          return totalDocs === 1
+        },
+      },
+    ),
     indexes: [{ fields: ['definition', 'createdAt'] }],
     fields: [
       { name: 'title', type: 'text', required: true },
@@ -697,6 +736,17 @@ export function entryCollection({
       },
     ],
     hooks: {
+      ...(workspace && { beforeOperation: [inheritDuplicateScope('definition')] }),
+      beforeChange: [
+        ({ data, operation, originalDoc }) => {
+          // Payload strips update-protected fields from version restores before
+          // required-field validation. Reuse the current entry's definition.
+          if (operation === 'update' && data.definition === undefined && originalDoc) {
+            return { ...data, definition: originalDoc.definition }
+          }
+          return data
+        },
+      ],
       beforeDelete: [
         async ({ id, req }) => {
           const { totalDocs } = await req.payload.count({

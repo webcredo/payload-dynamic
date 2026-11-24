@@ -44,7 +44,7 @@ Install the beta from npm.
 npm install payload-dynamic@beta
 ```
 
-If the npm beta tag is not available yet, install the tarball from the [GitHub prerelease](https://github.com/webcredo/payload-dynamic/releases/tag/v0.1.1), or install a local copy with `npm install ./payload-dynamic-0.1.1.tgz`.
+If the npm beta tag is not available yet, install the tarball from the [GitHub releases](https://github.com/webcredo/payload-dynamic/releases), or install a local copy with `npm install ./payload-dynamic-0.2.0.tgz`.
 
 ### Build a tarball from source
 
@@ -110,17 +110,18 @@ Use your application's normal migration workflow for production. The plugin exte
 
 ### Options
 
-The root entry exports `payloadDynamic` and the type `PayloadDynamicOptions`.
+The root entry exports `payloadDynamic` and the types `PayloadDynamicOptions`, `PayloadDynamicAccess`, and `PayloadDynamicWorkspace`.
 
-| Option             | Type                     | Meaning                                                                                                           |
-| ------------------ | ------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `canManage`        | Payload `Access`         | Required access policy for definitions and entries. Apply an appropriate authenticated/role-based policy.         |
-| `uploadCollection` | Payload `CollectionSlug` | Optional existing upload collection for upload fields. The plugin protects referenced uploads against deletion.   |
-| `enabled`          | `boolean`                | Defaults to `true`. When `false`, returns the exact host config unchanged, without validating or adding anything. |
-| `collections`      | `{ slug?, labels? }`     | Overrides the definitions collection. Defaults to `collections` with **Collection** / **Collections** labels.     |
-| `entries`          | `{ slug?, labels? }`     | Overrides the records collection. Defaults to `entries` with **Entry** / **Entries** labels.                      |
+| Option             | Type                          | Meaning                                                                                                           |
+| ------------------ | ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `canManage`        | Payload `Access`              | Fallback access policy for definitions and entries. Apply an appropriate authenticated or role-based policy.      |
+| `uploadCollection` | Payload `CollectionSlug`      | Optional existing upload collection for upload fields. The plugin protects referenced uploads against deletion.   |
+| `workspace`        | `PayloadDynamicWorkspace`     | Optional membership scope backed by an existing host collection.                                                  |
+| `enabled`          | `boolean`                     | Defaults to `true`. When `false`, returns the exact host config unchanged, without validating or adding anything. |
+| `collections`      | `{ slug?, labels?, access? }` | Overrides the definitions collection. Defaults to `collections` with **Collection** / **Collections** labels.     |
+| `entries`          | `{ slug?, labels?, access? }` | Overrides the records collection. Defaults to `entries` with **Entry** / **Entries** labels.                      |
 
-Each override is optional. Set `labels.singular` and `labels.plural` independently using Payload's collection label format. Scoped lists and breadcrumbs show the selected record type's title.
+Each override is optional. The `access` object accepts `create`, `read`, `update`, and `delete` callbacks and replaces `canManage` for the specified operations. Return a boolean from `create`. Reads, updates, and deletes also accept native Payload `Where` constraints. Set `labels.singular` and `labels.plural` independently using Payload's collection label format. Scoped lists and breadcrumbs show the selected record type's title.
 
 ```ts
 payloadDynamic({
@@ -139,6 +140,36 @@ payloadDynamic({
 Use distinct slugs that are available in the host app and in SQL. For example, `content-types` and `content_types` share a SQL name. With the settings above, use `/api/content-types` and `/api/content-records` in REST calls and the same slugs in the Local API. The plugin uses the configured slugs for admin links and relationships. The main SQL tables keep their existing names. When changing slugs in an existing app, update API callers, regenerate Payload types and the import map, and review the generated database migration.
 
 A configured `uploadCollection` must exist and have uploads enabled.
+
+### Workspace access
+
+Use an existing collection, such as teams or organizations, as the workspace collection. The host resolves the workspace IDs allowed for each request. The plugin applies that membership to collection definitions, their entries, and their version history alongside the configured operation policies.
+
+```ts
+payloadDynamic({
+  canManage: ({ req }) => Boolean(req.user),
+  collections: {
+    access: {
+      create: ({ req }) => canDesignCollections(req.user),
+      update: ({ req }) => canDesignCollections(req.user),
+      delete: ({ req }) => canDesignCollections(req.user),
+    },
+  },
+  entries: {
+    access: { delete: ({ req }) => canDeleteEntries(req.user) },
+  },
+  workspace: {
+    collection: 'teams',
+    allowedIDs: (req) => teamIDsForUser(req.user),
+  },
+})
+```
+
+The example uses host-defined role and membership functions. Resolve membership from trusted request state and return an empty array for callers without access. Pass `overrideAccess: false` to the Local API for user requests. Writers need read access to their definition to load its fields. Definition authors need read access to the host workspace record to select it.
+
+Select a workspace when creating a definition. Slugs are unique within that workspace, and the workspace is fixed after creation. Duplicated definitions keep their workspace and receive a new slug. Entries inherit the definition's workspace. Dynamic relationship fields stay within that workspace. The plugin blocks permanent deletion while a workspace owns definitions. The host decides whether archived or trashed workspaces remain eligible in `allowedIDs`. The host upload collection controls file access.
+
+Enabling workspace mode changes the SQL schema. For an existing installation, prepare a migration that assigns workspace IDs to current definitions and their retained versions before enforcing the required relationship and per-workspace slug index. Keep linked definitions and existing relationship values in the same workspace, or remap those links before enabling the feature. Existing configurations that omit `workspace` use the same tables and global slug uniqueness.
 
 ### Admin components and import map
 

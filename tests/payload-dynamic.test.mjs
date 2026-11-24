@@ -144,6 +144,7 @@ async function withFixture(
       manager,
       outsider,
       outsiderUser,
+      login,
       schemaName,
       user,
       anonymous: request.bind(null, { config, key }),
@@ -1407,3 +1408,292 @@ test(
   { skip: !postgresURL },
   () => withFixture(verifyPostgresFields, postgresURL),
 )
+
+test('operation policies differentiate create and update during explicit validation', () =>
+  withFixture(
+    async ({ payload, manager, user, outsiderUser }) => {
+      const data = { title: 'Room', slug: 'room', fields: [capacity] }
+      const validateAs = (user, options) =>
+        payload.validate({
+          collection: definitionSlug,
+          data,
+          user,
+          overrideAccess: false,
+          ...options,
+        })
+      assert.equal((await validateAs(user)).valid, true)
+      await assert.rejects(validateAs(outsiderUser), { status: 403 })
+
+      const { doc } = await manager('POST', definitions, 201, data)
+      await assert.rejects(validateAs(user, { id: doc.id }), { status: 403 })
+      assert.equal((await validateAs(outsiderUser, { id: doc.id })).valid, true)
+    },
+    undefined,
+    {
+      collections: {
+        access: {
+          create: ({ req }) => req.user?.email === 'manager@example.test',
+          update: ({ req }) => req.user?.email === 'other@example.test',
+        },
+      },
+    },
+  ))
+
+for (const [adapter, url] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(`workspace scopes and operation-specific policies apply on ${adapter}`, {
+    skip: adapter === 'PostgreSQL' && !url,
+  }, async () => {
+    const memberships = new Map()
+    const signedIn = ({ req }) => Boolean(req.user)
+    await withFixture(
+      async ({ payload, manager, outsider, outsiderUser, user, login, anonymous }) => {
+        const north = await payload.create({
+          collection: 'workspaces',
+          data: { name: 'North' },
+          overrideAccess: true,
+        })
+        const south = await payload.create({
+          collection: 'workspaces',
+          data: { name: 'South' },
+          overrideAccess: true,
+        })
+        const { request: shared, user: sharedUser } = await login('shared@example.test')
+        memberships.set(user.email, [north.id])
+        memberships.set(outsiderUser.email, [south.id])
+        memberships.set(sharedUser.email, [north.id, south.id])
+
+        const definition = (workspace, title) => ({
+          title,
+          slug: 'rooms',
+          workspace,
+          fields: [capacity],
+        })
+        const { doc: northRooms } = await manager('POST', `${definitions}?depth=0`, 201, {
+          ...definition(north.id, 'North rooms'),
+        })
+        const { doc: southRooms } = await outsider('POST', `${definitions}?depth=0`, 201, {
+          ...definition(south.id, 'South rooms'),
+        })
+        await manager('DELETE', `/api/workspaces/${north.id}`, 409)
+        const { request: noWorkspace } = await login('no-workspace@example.test')
+        await noWorkspace('GET', definitions, 403)
+        await noWorkspace('GET', entries, 403)
+        await manager('POST', definitions, 400, definition(north.id, 'Duplicate in North'))
+        await manager('POST', definitions, 403, definition(south.id, 'Outside North'))
+        await shared('PATCH', `${definitions}/${northRooms.id}`, 409, { workspace: south.id })
+        await outsider('PATCH', `${definitions}/${northRooms.id}`, 403, { title: 'Foreign title' })
+        await outsider('GET', `${definitions}/${northRooms.id}`, 404)
+        assert.deepEqual(
+          (await outsider('GET', definitions, 200)).docs.map(({ id }) => id),
+          [southRooms.id],
+        )
+        await anonymous('GET', definitions, 403)
+        const copiedDefinition = await manager(
+          'POST',
+          `${definitions}/${northRooms.id}/duplicate?depth=0`,
+          200,
+          {},
+        )
+        assert.equal(copiedDefinition.doc.workspace, north.id)
+        assert.match(copiedDefinition.doc.slug, /^rooms-copy-[a-f0-9]{12}$/)
+        await outsider('POST', `${definitions}/${northRooms.id}/duplicate`, 403, {})
+
+        const relatedRoom = (targetDefinition) => ({
+          key: 'room',
+          label: 'Room',
+          fieldType: 'relationship',
+          targetDefinition,
+        })
+        const links = (targetDefinition) => ({
+          title: 'Links',
+          slug: 'links',
+          workspace: north.id,
+          fields: [relatedRoom(targetDefinition)],
+        })
+        await shared('POST', definitions, 400, links(southRooms.id))
+        const { doc: northLinks } = await shared(
+          'POST',
+          `${definitions}?depth=0`,
+          201,
+          links(northRooms.id),
+        )
+
+        const values = [{ fieldKey: 'capacity', numberValue: 25 }]
+        const northEntry = await createEntry(manager, 'North lobby', northRooms.id, values)
+        const southEntry = await createEntry(outsider, 'South lobby', southRooms.id, values)
+        const copiedEntry = await manager(
+          'POST',
+          `${entries}/${northEntry.id}/duplicate?depth=0`,
+          200,
+          {},
+        )
+        assert.equal(copiedEntry.doc.definition, northRooms.id)
+        assert.equal(value(copiedEntry.doc, 'capacity', 'numberValue'), 25)
+        await outsider('POST', `${entries}/${northEntry.id}/duplicate`, 403, {})
+
+        const scopedCreate = await manager(
+          'POST',
+          `${entries}?depth=0&entryDefinition=${northRooms.id}`,
+          201,
+          { title: 'Created from scoped list', values },
+        )
+        assert.equal(scopedCreate.doc.definition, northRooms.id)
+        await createEntry(outsider, 'Hidden entry', southRooms.id, values)
+        await outsider('POST', `${entries}?entryDefinition=${northRooms.id}`, 403, {
+          title: 'Foreign default',
+          values,
+        })
+        await outsider('POST', `${entries}?entryDefinition=${southRooms.id}`, 403, {
+          title: 'Forged definition',
+          definition: northRooms.id,
+          workspace: south.id,
+          values,
+        })
+        await outsider('GET', `${entries}/${northEntry.id}`, 404)
+        await outsider('PATCH', `${entries}/${northEntry.id}`, 403, { title: 'Foreign edit' })
+        await outsider('PATCH', `${entries}/${southEntry.id}`, 200, { title: 'Own edit' })
+        await outsider('DELETE', `${entries}/${southEntry.id}`, 403)
+        await manager('DELETE', `${entries}/${southEntry.id}`, 403)
+        await shared('POST', entries, 400, {
+          title: 'Cross-workspace relationship',
+          definition: northLinks.id,
+          values: [{ fieldKey: 'room', relationshipValue: southEntry.id }],
+        })
+
+        assert.deepEqual(
+          (await outsider('GET', entries, 200)).docs.map(({ id }) => id),
+          [southEntry.id],
+        )
+        const localFind = await payload.find({
+          collection: entrySlug,
+          depth: 0,
+          overrideAccess: false,
+          user: outsiderUser,
+        })
+        assert.deepEqual(
+          localFind.docs.map(({ id }) => id),
+          [southEntry.id],
+        )
+        await assert.rejects(
+          payload.create({
+            collection: entrySlug,
+            data: { title: 'Foreign Local API entry', definition: northRooms.id, values },
+            overrideAccess: false,
+            user: outsiderUser,
+          }),
+          { status: 403 },
+        )
+
+        const trustedEntry = await payload.create({
+          collection: entrySlug,
+          data: { title: 'Trusted North entry', definition: northRooms.id, values },
+          depth: 0,
+          overrideAccess: true,
+          user: outsiderUser,
+        })
+        assert.equal(trustedEntry.definition, northRooms.id)
+        assert.equal(value(trustedEntry, 'capacity', 'numberValue'), 25)
+        await assert.rejects(
+          payload.create({
+            collection: definitionSlug,
+            data: { ...links(southRooms.id), slug: 'trusted-cross-workspace' },
+            overrideAccess: true,
+            user: outsiderUser,
+          }),
+          { status: 400, message: /target collection does not exist in this workspace/ },
+        )
+
+        assert.equal((await outsider('GET', `${entries}/count`, 200)).totalDocs, 1)
+        const bothEntries = new URLSearchParams({
+          'where[id][in]': `${northEntry.id},${southEntry.id}`,
+          depth: '0',
+        })
+        const updated = await outsider('PATCH', `${entries}?${bothEntries}`, 200, {
+          title: 'Scoped bulk edit',
+        })
+        assert.deepEqual(
+          updated.docs.map(({ id }) => id),
+          [southEntry.id],
+        )
+        assert.equal(updated.docs[0].title, 'Scoped bulk edit')
+        assert.equal(
+          (await manager('GET', `${entries}/${northEntry.id}`, 200)).title,
+          'North lobby',
+        )
+
+        const northVersions = await manager('GET', `${entries}/versions?depth=0`, 200)
+        const northVersion = northVersions.docs.find(({ parent }) => parent === northEntry.id)
+        assert.ok(northVersion)
+        await outsider('GET', `${entries}/versions/${northVersion.id}`, 403)
+        await manager('PATCH', `${entries}/${northEntry.id}`, 200, { title: 'Renamed lobby' })
+        await outsider('POST', `${entries}/versions/${northVersion.id}`, 403)
+        const restored = await manager(
+          'POST',
+          `${entries}/versions/${northVersion.id}?depth=0`,
+          200,
+        )
+        assert.equal(restored.id, northEntry.id)
+        assert.equal(restored.title, 'North lobby')
+        assert.equal(restored.definition, northRooms.id)
+        const southVersions = await outsider('GET', `${entries}/versions?depth=0`, 200)
+        assert.ok(southVersions.docs.length)
+        assert.ok(southVersions.docs.every(({ parent }) => parent === southEntry.id))
+
+        const deleted = await manager('DELETE', `${entries}?${bothEntries}`, 200)
+        assert.deepEqual(
+          deleted.docs.map(({ id }) => id),
+          [northEntry.id],
+        )
+        await manager('GET', `${entries}/${northEntry.id}`, 404)
+        assert.equal(
+          (await outsider('GET', `${entries}/${southEntry.id}`, 200)).title,
+          'Scoped bulk edit',
+        )
+
+        const sameWorkspaceLink = await createEntry(shared, 'North link', northLinks.id, [
+          { fieldKey: 'room', relationshipValue: trustedEntry.id },
+        ])
+        assert.equal(value(sameWorkspaceLink, 'room', 'relationshipValue'), trustedEntry.id)
+
+        // Simulate a legacy link left behind by an incomplete workspace backfill.
+        await payload.db.updateOne({
+          collection: definitionSlug,
+          id: northLinks.id,
+          data: { fields: [{ ...northLinks.fields[0], targetDefinition: southRooms.id }] },
+        })
+        const invalidLink = await shared('POST', entries, 400, {
+          title: 'Legacy cross-workspace relationship',
+          definition: northLinks.id,
+          values: [{ fieldKey: 'room', relationshipValue: southEntry.id }],
+        })
+        assert.match(invalidLink.errors[0].message, /outside its target or inaccessible/)
+
+        memberships.delete(outsiderUser.email)
+        await outsider('GET', definitions, 403)
+        await outsider('GET', `${entries}/count`, 403)
+        await outsider('GET', `${entries}/versions`, 403)
+        await outsider('PATCH', `${entries}/${southEntry.id}`, 403, { title: 'Revoked edit' })
+      },
+      url,
+      {
+        collections: { access: { create: signedIn, read: signedIn, update: signedIn } },
+        entries: {
+          access: {
+            create: signedIn,
+            read: ({ req }) => Boolean(req.user) && { title: { not_equals: 'Hidden entry' } },
+            update: signedIn,
+          },
+        },
+        workspace: {
+          collection: 'workspaces',
+          allowedIDs: async (req) => memberships.get(req.user?.email) ?? [],
+        },
+      },
+      [{ slug: 'workspaces', fields: [{ name: 'name', type: 'text' }] }],
+      true,
+    )
+  })
+}
