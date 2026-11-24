@@ -36,6 +36,7 @@ import {
 } from './entry-values'
 import { normalizePostgresValue, postgresValueFields } from './postgres-fields'
 import { lockDefinition } from './schema-transaction'
+import type { StorageNames } from './storage'
 
 const entryAdminComponents = {
   arrayField: 'payload-dynamic/react#EntryFields',
@@ -124,7 +125,12 @@ function entryHooks({
   entrySlug,
   uploadCollection,
   scoped,
-}: CollectionSlugs & { uploadCollection?: CollectionSlug; scoped: boolean }) {
+  storage,
+}: CollectionSlugs & {
+  uploadCollection?: CollectionSlug
+  scoped: boolean
+  storage: StorageNames
+}) {
   type Operation = { req: PayloadRequest; overrideAccess: boolean; workspaceID?: ID }
 
   // Native relationship controls ask for filters per row during one form-state request.
@@ -441,7 +447,7 @@ function entryHooks({
     if (id === undefined || (previousID !== undefined && String(id) !== String(previousID))) {
       throw new APIError('Choose a collection when creating an entry. It cannot be changed.', 400)
     }
-    const synchronized = await lockDefinition(req, id)
+    const synchronized = await lockDefinition(req, storage.definitions, id)
     if (synchronized && originalDoc?.id !== undefined) {
       const latest = await req.payload.findByID({
         collection: entrySlug,
@@ -481,6 +487,7 @@ export function entryCollection({
   entrySlug,
   labels,
   postgres,
+  storage,
   uploadCollection,
   workspace,
 }: CollectionSlugs & {
@@ -488,6 +495,7 @@ export function entryCollection({
   canManage: Access
   labels?: CollectionConfig['labels']
   postgres: boolean
+  storage: StorageNames
   uploadCollection?: CollectionSlug
   workspace?: PayloadDynamicWorkspace
 }): CollectionConfig {
@@ -496,6 +504,7 @@ export function entryCollection({
     entrySlug,
     uploadCollection,
     scoped: Boolean(workspace),
+    storage,
   })
   const fieldTypes = availableFieldTypes(postgres).map(({ value }) => value)
 
@@ -615,7 +624,7 @@ export function entryCollection({
       fields.push({
         name: 'rows',
         type: 'array',
-        dbName: `collection_entry_rows_${level}`,
+        dbName: storage.entryRows(level),
         maxRows: 100,
         admin: {
           condition: visibleFor('array', 'group', 'blocks', 'tabs'),
@@ -634,7 +643,7 @@ export function entryCollection({
           {
             name: 'items',
             type: 'array',
-            dbName: `collection_entry_items_${level}`,
+            dbName: storage.entryItems(level),
             maxRows: 100,
             admin: {
               components: {
@@ -654,7 +663,7 @@ export function entryCollection({
   return {
     slug: entrySlug,
     // Keep the SQL table when the public slug changes.
-    dbName: 'collection_entries',
+    dbName: storage.entries,
     labels: { singular: labels?.singular ?? 'Entry', plural: labels?.plural ?? 'Entries' },
     admin: {
       group: false,

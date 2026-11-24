@@ -20,6 +20,7 @@ import {
 import type { CollectionSlugs } from './entry-list'
 import { hasStoredValue, normalizeDate, referenceID } from './entry-values'
 import { lockDefinition } from './schema-transaction'
+import type { StorageNames } from './storage'
 
 const fieldTypeOptions = [
   { label: 'Text', value: 'text' },
@@ -440,6 +441,7 @@ function fieldDefinitions(
   options: (typeof fieldTypeOptions)[number][],
   definitionSlug: CollectionSlug,
   scoped: boolean,
+  storage: StorageNames,
   depth = 0,
 ): Field[] {
   const fields: Field[] = [
@@ -558,11 +560,11 @@ function fieldDefinitions(
     fields.push({
       name: 'fields',
       type: 'array',
-      dbName: `collection_def_fields_l${depth + 1}`,
+      dbName: storage.nestedDefinitions(depth + 1),
       labels: { singular: 'Nested field', plural: 'Nested fields' },
       maxRows: maxDefinitionRows,
       admin: { condition: onlyFor(...structureTypes) },
-      fields: fieldDefinitions(options, definitionSlug, scoped, depth + 1),
+      fields: fieldDefinitions(options, definitionSlug, scoped, storage, depth + 1),
     })
   }
   return fields
@@ -581,6 +583,7 @@ export function definitionCollection({
   entrySlug,
   labels,
   postgres,
+  storage,
   uploadCollection,
   workspace,
 }: CollectionSlugs & {
@@ -588,6 +591,7 @@ export function definitionCollection({
   canManage: Access
   labels?: CollectionConfig['labels']
   postgres: boolean
+  storage: StorageNames
   uploadCollection?: string
   workspace?: PayloadDynamicWorkspace
 }): CollectionConfig {
@@ -616,7 +620,7 @@ export function definitionCollection({
   return {
     slug: definitionSlug,
     // Keep the SQL table when the public slug changes.
-    dbName: 'collection_definitions',
+    dbName: storage.definitions,
     labels: { singular: labels?.singular ?? 'Collection', plural: labels?.plural ?? 'Collections' },
     admin: {
       useAsTitle: 'title',
@@ -668,7 +672,7 @@ export function definitionCollection({
         type: 'array',
         required: true,
         maxRows: maxDefinitionRows,
-        fields: fieldDefinitions(options, definitionSlug, Boolean(workspace)),
+        fields: fieldDefinitions(options, definitionSlug, Boolean(workspace), storage),
       },
     ],
     hooks: {
@@ -700,7 +704,7 @@ export function definitionCollection({
           const fields = await normalizeFields(data.fields, req, types)
 
           if (operation === 'update' && originalDoc) {
-            const synchronized = await lockDefinition(req, originalDoc.id)
+            const synchronized = await lockDefinition(req, storage.definitions, originalDoc.id)
             if (synchronized) {
               const latest = await req.payload.findByID({
                 collection: definitionSlug,

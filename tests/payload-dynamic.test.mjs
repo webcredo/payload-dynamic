@@ -79,6 +79,7 @@ async function withFixture(
   pluginOptions,
   hostCollections = [],
   sqliteTransactions = false,
+  adapterOptions = {},
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'payload-dynamic-test-'))
   const dbURL = pathToFileURL(join(dir, 'db.sqlite')).href
@@ -96,11 +97,13 @@ async function withFixture(
           disableCreateDatabase: true,
           push: true,
           schemaName,
+          ...adapterOptions,
         })
       : sqliteAdapter({
           client: { url: dbURL },
           push: true,
           ...(sqliteTransactions ? { transactionOptions: {} } : {}),
+          ...adapterOptions,
         }),
     graphQL: { disable: true },
     logger: { options: { level: 'fatal' } },
@@ -1402,6 +1405,322 @@ for (const [adapter, url] of [
       ),
   )
 }
+
+for (const [adapter, url] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `prefixed storage coexists with host collections on ${adapter}`,
+    { skip: adapter === 'PostgreSQL' && !url },
+    () =>
+      withFixture(
+        async ({ payload, manager }) => {
+          const definitions = '/api/content-types'
+          const entries = '/api/content-records'
+          const names = payload.db.rawTables
+          for (const name of [
+            'collection_definitions',
+            'collection_entries',
+            'workshop_definitions',
+            '_workshop_definitions_v_version_fields',
+            'workshop_def_fields_l1',
+            '_workshop_def_fields_l1_v',
+            'workshop_def_fields_l2',
+            '_workshop_def_fields_l2_v',
+            'workshop_entries',
+            'workshop_entries_values',
+            '_workshop_entries_v_version_values',
+            'workshop_entry_rows_1',
+            '_workshop_entry_rows_1_v',
+            'workshop_entry_rows_2',
+            '_workshop_entry_rows_2_v',
+            'workshop_entry_items_1',
+            '_workshop_entry_items_1_v',
+            'workshop_entry_items_2',
+            '_workshop_entry_items_2_v',
+          ]) {
+            assert.ok(names[name], `Missing physical table ${name}`)
+          }
+          assert.equal(names._workshop_definitions_v_version_fields.columns.label.notNull, true)
+          assert.deepEqual(
+            names.workshop_entries_values.indexes.workshop_values_key_number_parent_idx.on,
+            ['fieldKey', 'numberValue', '_parentID'],
+          )
+          assert.equal(
+            names.workshop_entries_values.indexes.collection_values_key_number_parent_idx,
+            undefined,
+          )
+
+          const { doc: hostDefinition } = await manager('POST', '/api/collections', 201, {
+            label: 'Existing host definition',
+          })
+          const { doc: hostEntry } = await manager('POST', '/api/entries', 201, {
+            note: 'Existing host entry',
+          })
+          const fieldType = url ? 'json' : 'text'
+          const column = url ? 'jsonValue' : 'textValue'
+          const schema = [
+            capacity,
+            { key: 'data', fieldType },
+            {
+              key: 'settings',
+              fieldType: 'group',
+              fields: [
+                {
+                  key: 'nested',
+                  fieldType: 'group',
+                  fields: [{ key: 'metadata', fieldType }],
+                },
+              ],
+            },
+          ]
+          const definition = await createDefinition(manager, 'Rooms', 'rooms', schema, definitions)
+          const values = [
+            { fieldKey: 'capacity', numberValue: 42 },
+            { fieldKey: 'data', [column]: '{"literal":true}' },
+            {
+              fieldKey: 'settings',
+              rows: [
+                {
+                  items: [
+                    {
+                      fieldKey: 'nested',
+                      rows: [{ items: [{ fieldKey: 'metadata', [column]: '[0,1]' }] }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ]
+          const entry = await createEntry(manager, 'Lobby', definition.id, values, entries)
+          await manager('PATCH', `${definitions}/${definition.id}`, 200, {
+            fields: [...schema, { key: 'extra', fieldType: 'text' }],
+          })
+          const { doc: updated } = await manager('PATCH', `${entries}/${entry.id}`, 200, {
+            title: 'Renamed lobby',
+          })
+          assert.equal(value(updated, 'data', column), '{"literal":true}')
+          const versions = await manager('GET', `${entries}/versions?depth=0`, 200)
+          const original = versions.docs.find(({ version }) => version.title === 'Lobby')
+          assert.ok(original)
+          assert.equal(value(original.version, 'data', column), '{"literal":true}')
+          const nested = value(original.version, 'settings', 'rows')[0].items[0]
+          assert.equal(nested.rows[0].items[0][column], '[0,1]')
+          const restored = await manager('POST', `${entries}/versions/${original.id}?depth=0`, 200)
+          assert.equal(restored.id, entry.id)
+          assert.equal(restored.title, 'Lobby')
+          assert.equal(restored.definition, definition.id)
+          assert.equal(
+            (await manager('GET', `/api/collections/${hostDefinition.id}`, 200)).label,
+            'Existing host definition',
+          )
+          assert.equal(
+            (await manager('GET', `/api/entries/${hostEntry.id}`, 200)).note,
+            'Existing host entry',
+          )
+        },
+        url,
+        {
+          collections: { slug: 'content-types' },
+          entries: { slug: 'content-records' },
+          storagePrefix: 'workshop',
+        },
+        [
+          {
+            slug: 'collections',
+            dbName: 'collection_definitions',
+            timestamps: false,
+            versions: false,
+            fields: [{ name: 'label', type: 'text', required: true }],
+          },
+          {
+            slug: 'entries',
+            dbName: 'collection_entries',
+            fields: [{ name: 'note', type: 'text', required: true }],
+          },
+        ],
+        true,
+      ),
+  )
+}
+
+for (const [adapter, url] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(`prefixed storage rejects aliases that could overwrite the host catalog on ${adapter}`, {
+    skip: adapter === 'PostgreSQL' && !url,
+  }, async () => {
+    const options = {
+      collections: { slug: 'content-types' },
+      entries: { slug: 'content-records' },
+      storagePrefix: 'workshop',
+    }
+    const field = { name: 'legacyField', type: 'text' }
+    const cases = [
+      {
+        host: { slug: 'legacy', dbName: () => 'workshop_entries', fields: [field] },
+        error: /SQL (name|table) "workshop_entries" conflicts/,
+      },
+      {
+        host: { slug: 'legacy', dbName: 'Workshop_Entries', fields: [field] },
+        error: /SQL name "Workshop_Entries" conflicts/,
+      },
+      {
+        host: { slug: 'workshop-entries-values', fields: [field] },
+        error: /SQL name "workshop_entries_values" conflicts/,
+      },
+      {
+        host: { slug: 'workshop-entries-values', dbName: 'legacy_content', fields: [field] },
+        error: /SQL name "workshop_entries_values" conflicts/,
+      },
+      {
+        host: {
+          slug: 'content',
+          fields: [{ name: 'records', type: 'array', fields: [field] }],
+        },
+        error: /SQL registration "content_records" conflicts/,
+      },
+      {
+        host: {
+          slug: 'content',
+          versions: false,
+          fields: [{ name: 'records', type: 'array', dbName: 'workshop_entries', fields: [field] }],
+        },
+        error: /SQL (name|table) "workshop_entries" conflicts/,
+      },
+      {
+        host: {
+          slug: 'content',
+          versions: false,
+          fields: [
+            {
+              name: 'records',
+              type: 'array',
+              dbName: () => 'workshop_entries',
+              fields: [field],
+            },
+          ],
+        },
+        error: /SQL (name|table) "workshop_entries" conflicts/,
+      },
+    ]
+    for (const { host, error } of cases) {
+      await assert.rejects(
+        withFixture(
+          () => assert.fail('A conflicting SQL layout must never connect'),
+          url,
+          options,
+          [host],
+        ),
+        error,
+      )
+    }
+  })
+}
+
+for (const [adapter, url] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `prefixed storage rejects generated relationship table conflicts on ${adapter}`,
+    {
+      skip: adapter === 'PostgreSQL' && !url,
+    },
+    () =>
+      assert.rejects(
+        withFixture(
+          () => assert.fail('A conflicting SQL layout must never connect'),
+          url,
+          { storagePrefix: 'workshop' },
+          [
+            {
+              slug: 'work',
+              fields: [
+                { type: 'relationship', name: 'assignees', relationTo: ['users'], hasMany: true },
+              ],
+            },
+          ],
+          false,
+          { relationshipsSuffix: 'shop_entries' },
+        ),
+        /SQL table "workshop_entries" conflicts/,
+      ),
+  )
+}
+
+test(
+  'prefixed storage rejects generated PostgreSQL enum and table conflicts',
+  {
+    skip: !postgresURL,
+  },
+  () =>
+    assert.rejects(
+      withFixture(
+        () => assert.fail('A conflicting SQL layout must never connect'),
+        postgresURL,
+        { storagePrefix: 'enum' },
+        [{ slug: 'entry', fields: [{ type: 'select', name: 'rows_1', options: ['legacy'] }] }],
+      ),
+      /SQL enum "enum_entry_rows_1" conflicts/,
+    ),
+)
+
+test(
+  'prefixed storage rejects duplicate PostgreSQL enums with conflicting options',
+  { skip: !postgresURL },
+  () =>
+    assert.rejects(
+      withFixture(
+        () => assert.fail('A conflicting SQL layout must never connect'),
+        postgresURL,
+        { storagePrefix: 'enum' },
+        [
+          {
+            slug: 'legacy',
+            fields: [
+              {
+                type: 'select',
+                name: 'tier',
+                options: ['legacy'],
+                enumName: 'enum_enum_definitions_fields_field_type',
+              },
+            ],
+          },
+        ],
+      ),
+      /SQL enum "enum_enum_definitions_fields_field_type" has conflicting options/,
+    ),
+)
+
+test('concurrent prefixed initialization preserves shared host callbacks', async () => {
+  const dbName = () => 'legacy_records'
+  const config = buildConfig({
+    secret: randomBytes(32).toString('hex'),
+    db: sqliteAdapter({ client: { url: 'file::memory:' } }),
+    logger: { options: { level: 'fatal' } },
+    telemetry: false,
+    graphQL: { disable: true },
+    typescript: { autoGenerate: false },
+    collections: [{ slug: 'legacy', dbName, fields: [] }],
+    plugins: [payloadDynamic({ canManage: () => true, storagePrefix: 'workshop' })],
+  })
+  const instances = await Promise.all(
+    [randomUUID(), randomUUID()].map((key) => getPayload({ config, key, disableDBConnect: true })),
+  )
+  try {
+    assert.equal((await config).collections.find(({ slug }) => slug === 'legacy').dbName, dbName)
+    for (const payload of instances) {
+      assert.equal(payload.collections.legacy.config.dbName, dbName)
+      assert.ok(payload.db.rawTables.legacy_records)
+      assert.ok(payload.db.rawTables.workshop_entries)
+    }
+  } finally {
+    await Promise.all(instances.map((payload) => payload.destroy()))
+  }
+})
 
 test(
   'JSON and Rich Text work in PostgreSQL through the Local and REST APIs',
