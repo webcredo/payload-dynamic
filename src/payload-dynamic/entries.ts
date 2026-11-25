@@ -27,6 +27,7 @@ import {
   type FieldType,
 } from './definitions'
 import { type CollectionSlugs, entryDefinitionParam } from './entry-list'
+import { hasEntryMatching } from './entry-queries'
 import {
   defaultValue,
   hasStoredValue,
@@ -39,6 +40,8 @@ import {
 import { normalizePostgresValue, postgresValueFields } from './postgres-fields'
 import { lockDefinition } from './schema-transaction'
 import type { StorageNames } from './storage'
+
+export { hasEntryMatching as hasEntryValueReferences } from './entry-queries'
 
 const entryAdminComponents = {
   arrayField: 'payload-dynamic/react#EntryFields',
@@ -95,27 +98,6 @@ export function entryValueReferences(
       [`values${'.rows.items'.repeat(depth)}.${column}`]: { equals: id },
     })),
   ).flat()
-}
-
-export async function hasEntryValueReferences(
-  req: PayloadRequest,
-  collection: CollectionSlug,
-  where: Where,
-): Promise<boolean> {
-  const query = { collection, req, where, overrideAccess: true }
-  if ((await req.payload.count(query)).totalDocs) return true
-  if (!hasDraftsEnabled(req.payload.collections[collection].config)) return false
-
-  // Draft reads select the latest version per document. Also check the live
-  // view above so a draft that clears a published reference cannot hide it.
-  const { docs } = await req.payload.find({
-    ...query,
-    draft: true,
-    depth: 0,
-    limit: 1,
-    select: { id: true },
-  })
-  return docs.length > 0
 }
 
 function readSchema(
@@ -846,7 +828,7 @@ export function entryCollection({
       ],
       beforeDelete: [
         async ({ id, req }) => {
-          const referenced = await hasEntryValueReferences(req, entrySlug, {
+          const referenced = await hasEntryMatching(req, entrySlug, {
             id: { not_equals: id },
             or: entryValueReferences(id, 'relationshipValue', 'relationshipValues'),
           })

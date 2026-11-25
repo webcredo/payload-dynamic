@@ -1859,10 +1859,75 @@ for (const [adapter, uri] of [
 
 const entryDrafts = { entries: { versions: { drafts: true, maxPerDoc: 0 } } }
 
+async function verifyDraftFieldEvolution({ manager }) {
+  const note = { key: 'note', label: 'Note', fieldType: 'text' }
+  const draftOnly = await createDefinition(manager, 'Unpublished', 'unpublished', [note])
+  const { doc: draft } = await manager('POST', `${entries}?draft=true&depth=0`, 201, {
+    title: 'First draft',
+    definition: draftOnly.id,
+    values: [{ fieldKey: 'note', textValue: 'Unpublished entry' }],
+  })
+  assert.equal(draft._status, 'draft')
+  await manager('DELETE', `${definitions}/${draftOnly.id}`, 409)
+
+  const definition = await createDefinition(manager, 'Draft evolution', 'draft-evolution', [
+    capacity,
+    note,
+  ])
+  const definitionURL = `${definitions}/${definition.id}?depth=0`
+  const publishedEmpty = await createEntry(manager, 'Published empty', definition.id, [])
+  const liveURL = (entry) => `${entries}/${entry.id}?depth=0`
+  const draftURL = (entry) => `${liveURL(entry)}&draft=true`
+  const draftNote = (entry, textValue) =>
+    manager('PATCH', draftURL(entry), 200, { values: [{ fieldKey: 'note', textValue }] })
+  const number = { ...note, fieldType: 'number' }
+
+  await draftNote(publishedEmpty, 'Draft value')
+  assert.equal(value(await manager('GET', liveURL(publishedEmpty), 200), 'note', 'textValue'), null)
+  assert.match(
+    JSON.stringify(await manager('PATCH', definitionURL, 409, { fields: [capacity] })),
+    /Note \(note\)/,
+  )
+  await manager('PATCH', definitionURL, 409, { fields: [capacity, number] })
+  const stillEditable = await manager('PATCH', draftURL(publishedEmpty), 200, {
+    title: 'Draft still editable',
+  })
+  assert.equal(value(stillEditable.doc, 'note', 'textValue'), 'Draft value')
+
+  await draftNote(publishedEmpty, null)
+  const publishedFilled = await createEntry(manager, 'Published filled', definition.id, [
+    { fieldKey: 'note', textValue: 'Published value' },
+  ])
+  await draftNote(publishedFilled, null)
+  // Latest drafts are now empty but the published value still protects the field.
+  await manager('PATCH', definitionURL, 409, { fields: [capacity, number] })
+  await manager('PATCH', liveURL(publishedFilled), 200, { _status: 'published' })
+
+  // Older populated versions remain in history. Only the two active views block evolution.
+  const { docs: versions } = await manager('GET', `${entries}/versions?depth=0`, 200)
+  assert.ok(
+    versions.some(
+      ({ parent, version }) =>
+        parent === publishedEmpty.id && value(version, 'note', 'textValue') === 'Draft value',
+    ),
+  )
+  await manager('PATCH', definitionURL, 200, { fields: [capacity, number] })
+  const { doc: evolved } = await manager('PATCH', draftURL(publishedEmpty), 200, {
+    values: [{ fieldKey: 'note', numberValue: 7 }],
+  })
+  assert.equal(value(evolved, 'note', 'numberValue'), 7)
+}
+
 for (const [adapter, uri] of [
   ['SQLite', undefined],
   ['PostgreSQL', postgresURL],
 ]) {
+  test(
+    `field edits preserve values in published entries and latest drafts on ${adapter}`,
+    { skip: adapter === 'PostgreSQL' && !uri },
+    () => withFixture(verifyDraftFieldEvolution, uri, entryDrafts, [], true),
+  )
+
   test(
     `singleton drafts publish to the same native ID on ${adapter}`,
     { skip: adapter === 'PostgreSQL' && !uri },

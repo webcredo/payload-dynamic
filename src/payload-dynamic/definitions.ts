@@ -6,6 +6,7 @@ import {
   type CollectionSlug,
   type Condition,
   type Field,
+  hasDraftsEnabled,
   type PayloadRequest,
   validations,
 } from 'payload'
@@ -18,6 +19,7 @@ import {
   withinWorkspace,
 } from './access'
 import type { CollectionSlugs } from './entry-list'
+import { hasEntryMatching } from './entry-queries'
 import { hasStoredValue, normalizeDate, referenceID } from './entry-values'
 import { lockDefinition } from './schema-transaction'
 import type { StorageNames } from './storage'
@@ -350,16 +352,6 @@ function collectTargets(fields: DefinitionField[], targetIDs: Map<string, ID>) {
   }
 }
 
-async function hasEntries(req: PayloadRequest, entrySlug: CollectionSlug, id: ID) {
-  const { totalDocs } = await req.payload.count({
-    collection: entrySlug,
-    overrideAccess: true,
-    req,
-    where: { definition: { equals: id } },
-  })
-  return totalDocs > 0
-}
-
 function fieldConflict(field: DefinitionField, reason: string): never {
   throw new APIError(`${field.label} (${field.key}): ${reason}`, 409)
 }
@@ -372,7 +364,8 @@ async function assertSafeFieldChanges(
   current: DefinitionField[],
   synchronized: boolean,
 ) {
-  if (!(await hasEntries(req, entrySlug, id))) return
+  const where = { definition: { equals: id } }
+  if (!(await hasEntryMatching(req, entrySlug, where))) return
   const byKey = new Map(current.map((field) => [field.key, field]))
   const changed = previous.filter((field) => !preservesField(field, byKey.get(field.key)))
   for (const field of changed) {
@@ -399,41 +392,53 @@ async function assertSafeFieldChanges(
     )
   }
 
-  // Read complete value rows: independent array predicates cannot prove that a
-  // key and every populated column belong to the same row on both adapters.
-  // Keyset pagination bounds each read and uses the caller's transaction, while
-  // overrideAccess prevents a manager's read filter from hiding populated entries.
-  let after: ID | undefined
-  while (true) {
-    const { docs } = await req.payload.find({
-      collection: entrySlug,
-      req,
-      overrideAccess: true,
-      depth: 0,
-      select: { values: true },
-      limit: 100,
-      pagination: false,
-      sort: 'id',
-      where: {
-        definition: { equals: id },
-        ...(after === undefined ? {} : { id: { greater_than: after } }),
-      },
-    })
-    for (const doc of docs) {
-      const rows = ('values' in doc && Array.isArray(doc.values) ? doc.values : []) as ({
-        fieldKey: string
-      } & Record<string, unknown>)[]
-      for (const field of changed) {
-        if (rows.some((row) => row.fieldKey === field.key && hasStoredValue(row))) {
-          fieldConflict(
-            field,
-            'Clear its values in every entry before removing or changing its type.',
-          )
+  const views = hasDraftsEnabled(req.payload.collections[entrySlug].config)
+    ? [false, true]
+    : [false]
+  // Read whole rows under the definition lock so a key and its value are
+  // checked together. Payload maps the draft query's ID cursor to version parents.
+  for (const draft of views) {
+    let after: ID | undefined
+    while (true) {
+      const { docs } = await req.payload.find({
+        collection: entrySlug,
+        req,
+        draft,
+        overrideAccess: true,
+        showHiddenFields: true,
+        depth: 0,
+        select: { values: true },
+        limit: 100,
+        pagination: false,
+        sort: 'id',
+        where: {
+          ...where,
+          ...(after === undefined ? {} : { id: { greater_than: after } }),
+        },
+      })
+      for (const doc of docs) {
+        const entryID = referenceID(doc.id)
+        const values = 'values' in doc ? doc.values : undefined
+        if (
+          entryID === undefined ||
+          entryID === after ||
+          (values != null && !Array.isArray(values))
+        ) {
+          throw new APIError('Could not verify current entry values before changing fields.', 409)
+        }
+        after = entryID
+        const rows = (values ?? []) as ({ fieldKey: string } & Record<string, unknown>)[]
+        for (const field of changed) {
+          if (rows.some((row) => row.fieldKey === field.key && hasStoredValue(row))) {
+            fieldConflict(
+              field,
+              'Clear its values in every entry and latest draft before removing or changing its type.',
+            )
+          }
         }
       }
+      if (docs.length < 100) break
     }
-    if (docs.length < 100) return
-    after = docs[docs.length - 1].id
   }
 }
 
@@ -793,7 +798,7 @@ export function definitionCollection({
       ],
       beforeDelete: [
         async ({ id, req }) => {
-          if (await hasEntries(req, entrySlug, id)) {
+          if (await hasEntryMatching(req, entrySlug, { definition: { equals: id } })) {
             throw new APIError('Delete the entries before deleting their collection.', 409)
           }
           const { totalDocs } = await req.payload.count({

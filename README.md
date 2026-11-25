@@ -168,7 +168,9 @@ Use the existing Entries API and scope the lookup to the definition ID. Update t
 
 Use `entries: { versions: { drafts: true, maxPerDoc: 0 } }` to enable drafts and retain all versions for Entries. The setting applies to every entry in the collection. Choose the retention policy before importing history so later writes preserve the imported versions.
 
-Run a host database migration before starting an existing installation with this option enabled. Existing definitions remain regular collections. The Entries API derives a nullable unique key for current entries, and version history remains attached to the entry. Imports should use the Payload API so the key is applied. When drafts are enabled, deletion checks both the published record and the latest draft for incoming links. Retained historical versions follow the host's Payload deletion policy. Keep the option enabled for databases that contain single-entry collections.
+Enable drafts on fresh or empty entry storage. For populated storage, first verify a data backfill on a restored copy that creates a matching published latest version for every existing entry. Applying the schema migration alone leaves existing entries out of Payload's draft views. Dynamic required fields are validated on every draft save, including when Payload's `drafts.validate` is `false`.
+
+Run a host database migration before enabling `singletons` on an existing installation. Existing definitions remain regular collections. The Entries API derives a nullable unique key for current entries, and version history remains attached to the entry. Imports should use the Payload API so the key is applied. When drafts are enabled, deletion checks both the published record and the latest draft for incoming links. Retained historical versions follow the host's Payload deletion policy. Keep the option enabled for databases that contain single-entry collections.
 
 ### Workspace access
 
