@@ -12,25 +12,29 @@ import {
 } from 'payload'
 import type { PayloadDynamicAccess, PayloadDynamicWorkspace } from './access'
 import { definitionCollection, definitionDepth } from './definitions'
-import { entryCollection, entryValueReferences } from './entries'
+import { entryCollection, entryValueReferences, hasEntryValueReferences } from './entries'
+import { createStorageNames, protectStorageNamespace, type StorageNames } from './storage'
 
 // SQL adapters store Array rows in their own table. CollectionConfig.indexes
 // applies to the parent table; this index covers a range on a single field key.
-function prepareNativeCollectionSchema<Schema>({
-  adapter,
-  schema,
-}: {
-  // The SQLite hook receives the adapter at runtime in beta.9.
-  adapter?: {
-    rawRelations: Record<string, Record<string, RawRelation>>
-    rawTables: Record<string, RawTable>
-    versionsSuffix?: string
-  }
-  schema: Schema
-}): Schema {
-  const table = adapter?.rawTables.collection_entries_values
+function prepareNativeCollectionSchema<Schema>(
+  storage: StorageNames,
+  {
+    adapter,
+    schema,
+  }: {
+    // The SQLite hook receives the adapter at runtime in beta.9.
+    adapter?: {
+      rawRelations: Record<string, Record<string, RawRelation>>
+      rawTables: Record<string, RawTable>
+      versionsSuffix?: string
+    }
+    schema: Schema
+  },
+): Schema {
+  const table = adapter?.rawTables[`${storage.entries}_values`]
   if (table) {
-    const name = 'collection_values_key_number_parent_idx'
+    const name = storage.numberIndex
     table.indexes = {
       ...table.indexes,
       [name]: { name, on: ['fieldKey', 'numberValue', '_parentID'] },
@@ -42,15 +46,15 @@ function prepareNativeCollectionSchema<Schema>({
     const { rawRelations, rawTables, versionsSuffix = '_v' } = adapter
     // The definition hook supplies a label before saving, including when the form leaves it blank.
     for (const tableName of [
-      'collection_definitions_fields',
-      `_collection_definitions${versionsSuffix}_version_fields`,
+      `${storage.definitions}_fields`,
+      `_${storage.definitions}${versionsSuffix}_version_fields`,
     ]) {
       const label = rawTables[tableName]?.columns.label
       if (label) label.notNull = true
     }
 
     for (let depth = 1; depth <= definitionDepth; depth++) {
-      const tableName = `collection_def_fields_l${depth}`
+      const tableName = storage.nestedDefinitions(depth)
       for (const child of [tableName, `_${tableName}${versionsSuffix}`]) {
         const toParent = rawRelations[child]?._parentID
         if (!toParent) continue
@@ -67,39 +71,33 @@ function prepareNativeCollectionSchema<Schema>({
   return schema
 }
 
-const preservePostgresJSONStrings: PostgresAdapter['afterSchemaInit'][number] = ({
-  adapter,
-  schema,
-}) => {
-  const suffix = adapter.versionsSuffix ?? '_v'
-  const tables = ['collection_entries_values', `_collection_entries${suffix}_version_values`]
-  for (let depth = 1; depth <= definitionDepth; depth++) {
-    const table = `collection_entry_items_${depth}`
-    tables.push(table, `_${table}${suffix}`)
-  }
-  for (const table of tables) {
-    const column = schema.tables[table]?.jsonValue
-    if (column) {
-      // The PostgreSQL driver already decodes JSON in Array results. Drizzle's
-      // decoder otherwise interprets JSON-looking string values a second time.
-      column.mapFromDriverValue = (value: unknown) => value
+const preservePostgresJSONStrings =
+  (storage: StorageNames): PostgresAdapter['afterSchemaInit'][number] =>
+  ({ adapter, schema }) => {
+    const suffix = adapter.versionsSuffix ?? '_v'
+    const tables = [`${storage.entries}_values`, `_${storage.entries}${suffix}_version_values`]
+    for (let depth = 1; depth <= definitionDepth; depth++) {
+      const table = storage.entryItems(depth)
+      tables.push(table, `_${table}${suffix}`)
     }
+    for (const table of tables) {
+      const column = schema.tables[table]?.jsonValue
+      if (column) {
+        // The PostgreSQL driver already decodes JSON in Array results. Drizzle's
+        // decoder otherwise interprets JSON-looking string values a second time.
+        column.mapFromDriverValue = (value: unknown) => value
+      }
+    }
+    return schema
   }
-  return schema
-}
 
 const preventReferencedUploadDeletion =
   (entrySlug: CollectionSlug): CollectionBeforeDeleteHook =>
   async ({ id, req }) => {
-    const { totalDocs } = await req.payload.count({
-      collection: entrySlug,
-      overrideAccess: true,
-      req,
-      where: {
-        or: entryValueReferences(id, 'uploadValue', 'uploadValues'),
-      },
+    const referenced = await hasEntryValueReferences(req, entrySlug, {
+      or: entryValueReferences(id, 'uploadValue', 'uploadValues'),
     })
-    if (totalDocs) throw new APIError('Remove references to this file before deleting it.', 409)
+    if (referenced) throw new APIError('Remove references to this file before deleting it.', 409)
   }
 
 const preventReferencedWorkspaceDeletion =
@@ -129,8 +127,12 @@ export type PayloadDynamicOptions = {
   canManage: Access
   uploadCollection?: CollectionSlug
   workspace?: PayloadDynamicWorkspace
+  /** Prefix to use for physical SQL storage in a shared database. */
+  storagePrefix?: string
+  /** Allow definitions whose entries are limited to one document. */
+  singletons?: boolean
   collections?: CollectionOverrides
-  entries?: CollectionOverrides
+  entries?: CollectionOverrides & Pick<CollectionConfig, 'versions'>
 }
 
 const routeSlug = /^[a-zA-Z0-9_-]+$/
@@ -145,7 +147,12 @@ const reservedPayloadSlugs = [
   'payload-query-presets',
 ]
 
-function validateCollectionSlugs(config: Config, definitionSlug: string, entrySlug: string) {
+function validateNames(
+  config: Config,
+  definitionSlug: string,
+  entrySlug: string,
+  storage: StorageNames,
+) {
   if (definitionSlug === entrySlug) {
     throw new Error('payload-dynamic requires distinct slugs for definitions and entries.')
   }
@@ -157,9 +164,16 @@ function validateCollectionSlugs(config: Config, definitionSlug: string, entrySl
   const reserved = new Set(reservedPayloadSlugs.map(sqlKey))
   if (!config.admin?.user && !collections.some(({ auth }) => auth)) reserved.add(sqlKey('users'))
 
-  const occupied = new Map(
-    [...collections, ...(config.globals ?? [])].map(({ slug }) => [sqlKey(slug), slug]),
-  )
+  const hosts = [...collections, ...(config.globals ?? [])]
+  const occupied = new Map(hosts.map(({ slug }) => [sqlKey(slug), slug]))
+  for (const host of hosts) {
+    const name = host.dbName ?? sqlKey(host.slug)
+    if (name === storage.definitions || name === storage.entries) {
+      throw new Error(
+        `payload-dynamic SQL table "${name}" conflicts with the host "${host.slug}". Configure an unused storagePrefix.`,
+      )
+    }
+  }
   for (const slug of [definitionSlug, entrySlug]) {
     if (typeof slug !== 'string' || !routeSlug.test(slug) || !/[a-zA-Z0-9]/.test(slug)) {
       throw new Error(
@@ -184,6 +198,8 @@ export function payloadDynamic({
   canManage,
   uploadCollection,
   workspace,
+  storagePrefix,
+  singletons = false,
   collections: definitionOptions,
   entries: entryOptions,
   enabled = true,
@@ -193,7 +209,8 @@ export function payloadDynamic({
     const collections = config.collections ?? []
     const definitionSlug = (definitionOptions?.slug ?? 'collections') as CollectionSlug
     const entrySlug = (entryOptions?.slug ?? 'entries') as CollectionSlug
-    validateCollectionSlugs(config, definitionSlug, entrySlug)
+    const storage = createStorageNames(storagePrefix)
+    validateNames(config, definitionSlug, entrySlug, storage)
     if (
       uploadCollection &&
       !collections.some(({ slug, upload }) => slug === uploadCollection && upload)
@@ -209,6 +226,8 @@ export function payloadDynamic({
     const options = {
       ...slugs,
       canManage,
+      storage,
+      singletons,
       postgres: config.db.name === 'postgres',
       uploadCollection,
       workspace,
@@ -239,7 +258,12 @@ export function payloadDynamic({
           access: definitionOptions?.access,
           labels: definitionOptions?.labels,
         }),
-        entryCollection({ ...options, access: entryOptions?.access, labels: entryOptions?.labels }),
+        entryCollection({
+          ...options,
+          access: entryOptions?.access,
+          labels: entryOptions?.labels,
+          versions: entryOptions?.versions,
+        }),
       ],
       admin: {
         ...config.admin,
@@ -258,16 +282,31 @@ export function payloadDynamic({
         ...config.db,
         init(args) {
           const adapter = config.db.init(args)
+          if (storagePrefix && (adapter.name === 'sqlite' || adapter.name === 'postgres')) {
+            protectStorageNamespace(
+              adapter as SQLiteAdapter | PostgresAdapter,
+              storagePrefix,
+              definitionSlug,
+              entrySlug,
+              storage,
+            )
+          }
           if (adapter.name === 'sqlite') {
             const sqlite = adapter as SQLiteAdapter
-            sqlite.beforeSchemaInit = [...sqlite.beforeSchemaInit, prepareNativeCollectionSchema]
+            sqlite.beforeSchemaInit = [
+              ...sqlite.beforeSchemaInit,
+              (args) => prepareNativeCollectionSchema(storage, args),
+            ]
           } else if (adapter.name === 'postgres') {
             const postgres = adapter as PostgresAdapter
             postgres.beforeSchemaInit = [
               ...postgres.beforeSchemaInit,
-              prepareNativeCollectionSchema,
+              (args) => prepareNativeCollectionSchema(storage, args),
             ]
-            postgres.afterSchemaInit = [...postgres.afterSchemaInit, preservePostgresJSONStrings]
+            postgres.afterSchemaInit = [
+              ...postgres.afterSchemaInit,
+              preservePostgresJSONStrings(storage),
+            ]
           }
           return adapter
         },

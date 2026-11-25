@@ -91,3 +91,26 @@ test('workspace mode requires an existing host collection', async () => {
     /workspace must be an existing Payload collection/,
   )
 })
+
+test('storage prefixes are validated before database initialization', async () => {
+  const { payloadDynamic } = await import(manifest.name)
+  const canManage = () => true
+  const config = { collections: [{ slug: 'legacy', dbName: 'collection_definitions', fields: [] }] }
+  for (const storagePrefix of ['', 'bad-name', 'x__', '9x', 'UPPER', '123456789', null]) {
+    assert.throws(
+      () => payloadDynamic({ canManage, storagePrefix })(config),
+      /invalid|storagePrefix must/,
+    )
+  }
+  assert.throws(
+    () => payloadDynamic({ canManage })(config),
+    /SQL table "collection_definitions" conflicts/,
+  )
+  assert.throws(
+    () =>
+      payloadDynamic({ canManage, storagePrefix: 'app' })({
+        collections: [{ slug: 'app-entries', fields: [] }],
+      }),
+    /SQL table "app_entries" conflicts/,
+  )
+})

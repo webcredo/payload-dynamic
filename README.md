@@ -112,14 +112,16 @@ Use your application's normal migration workflow for production. The plugin exte
 
 The root entry exports `payloadDynamic` and the types `PayloadDynamicOptions`, `PayloadDynamicAccess`, and `PayloadDynamicWorkspace`.
 
-| Option             | Type                          | Meaning                                                                                                           |
-| ------------------ | ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `canManage`        | Payload `Access`              | Fallback access policy for definitions and entries. Apply an appropriate authenticated or role-based policy.      |
-| `uploadCollection` | Payload `CollectionSlug`      | Optional existing upload collection for upload fields. The plugin protects referenced uploads against deletion.   |
-| `workspace`        | `PayloadDynamicWorkspace`     | Optional membership scope backed by an existing host collection.                                                  |
-| `enabled`          | `boolean`                     | Defaults to `true`. When `false`, returns the exact host config unchanged, without validating or adding anything. |
-| `collections`      | `{ slug?, labels?, access? }` | Overrides the definitions collection. Defaults to `collections` with **Collection** / **Collections** labels.     |
-| `entries`          | `{ slug?, labels?, access? }` | Overrides the records collection. Defaults to `entries` with **Entry** / **Entries** labels.                      |
+| Option             | Type                                     | Meaning                                                                                                           |
+| ------------------ | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `canManage`        | Payload `Access`                         | Fallback access policy for definitions and entries. Apply an appropriate authenticated or role-based policy.      |
+| `uploadCollection` | Payload `CollectionSlug`                 | Optional existing upload collection for upload fields. The plugin protects referenced uploads against deletion.   |
+| `storagePrefix`    | `string`                                 | Optional prefix for the plugin's SQL tables and numeric value index.                                              |
+| `singletons`       | `boolean`                                | Opt in to collection definitions that allow at most one entry.                                                    |
+| `workspace`        | `PayloadDynamicWorkspace`                | Optional membership scope backed by an existing host collection.                                                  |
+| `enabled`          | `boolean`                                | Defaults to `true`. When `false`, returns the exact host config unchanged, without validating or adding anything. |
+| `collections`      | `{ slug?, labels?, access? }`            | Overrides the definitions collection. Defaults to `collections` with **Collection** / **Collections** labels.     |
+| `entries`          | `{ slug?, labels?, access?, versions? }` | Overrides the records collection. Defaults to `entries` with **Entry** / **Entries** labels.                      |
 
 Each override is optional. The `access` object accepts `create`, `read`, `update`, and `delete` callbacks and replaces `canManage` for the specified operations. Return a boolean from `create`. Reads, updates, and deletes also accept native Payload `Where` constraints. Set `labels.singular` and `labels.plural` independently using Payload's collection label format. Scoped lists and breadcrumbs show the selected record type's title.
 
@@ -140,6 +142,35 @@ payloadDynamic({
 Use distinct slugs that are available in the host app and in SQL. For example, `content-types` and `content_types` share a SQL name. With the settings above, use `/api/content-types` and `/api/content-records` in REST calls and the same slugs in the Local API. The plugin uses the configured slugs for admin links and relationships. The main SQL tables keep their existing names. When changing slugs in an existing app, update API callers, regenerate Payload types and the import map, and review the generated database migration.
 
 A configured `uploadCollection` must exist and have uploads enabled.
+
+### SQL storage names
+
+By default, the plugin uses the existing SQL names `collection_definitions` and `collection_entries`. Set `storagePrefix` to use separate SQL tables when installing the plugin alongside a host that already uses those names. A prefix is 1–8 lowercase letters or digits and starts with a letter.
+
+```ts
+payloadDynamic({
+  canManage: signedIn,
+  storagePrefix: 'content',
+  collections: { slug: 'content-types' },
+  entries: { slug: 'content-records' },
+})
+```
+
+This example creates `content_definitions` and `content_entries` along with prefixed child tables, version tables, and indexes. The REST and Local API slugs are set separately. Choose an unused prefix. The plugin checks SQL names before connecting, including names returned by `dbName` callbacks and names generated for relationships and PostgreSQL enums. Review the migration generated by the host before applying it. A first installation should create these tables alongside the existing host tables.
+
+An existing plugin installation can keep its current names by leaving the option unset. Changing the prefix changes the target physical table names. To preserve existing data, prepare an explicit migration of definitions, entries, versions, child tables, indexes, foreign keys, and sequences, and verify the data in a restored copy before applying it.
+
+### Single-entry collections
+
+Set `singletons: true` to enable the optional `singleton` checkbox on collection definitions. Create a definition with `singleton: true` to allow at most one current entry. The setting is fixed at creation. Regular collections continue to allow multiple entries.
+
+Use the existing Entries API and scope the lookup to the definition ID. Update the existing entry and use its normal Payload version history. Creating or duplicating a second entry for the same definition fails, even with concurrent requests. Deleting the entry permits a new one.
+
+Use `entries: { versions: { drafts: true, maxPerDoc: 0 } }` to enable drafts and retain all versions for Entries. The setting applies to every entry in the collection. Choose the retention policy before importing history so later writes preserve the imported versions.
+
+Enable drafts on fresh or empty entry storage. For populated storage, first verify a data backfill on a restored copy that creates a matching published latest version for every existing entry. Applying the schema migration alone leaves existing entries out of Payload's draft views. Dynamic required fields are validated on every draft save, including when Payload's `drafts.validate` is `false`.
+
+Run a host database migration before enabling `singletons` on an existing installation. Existing definitions remain regular collections. The Entries API derives a nullable unique key for current entries, and version history remains attached to the entry. Imports should use the Payload API so the key is applied. When drafts are enabled, deletion checks both the published record and the latest draft for incoming links. Retained historical versions follow the host's Payload deletion policy. Keep the option enabled for databases that contain single-entry collections.
 
 ### Workspace access
 

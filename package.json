@@ -1,6 +1,6 @@
 {
   "name": "payload-dynamic",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Native runtime-defined collections for Payload CMS (SQLite and PostgreSQL)",
   "license": "MIT",
   "repository": {

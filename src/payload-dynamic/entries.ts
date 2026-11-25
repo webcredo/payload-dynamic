@@ -1,12 +1,14 @@
 import {
   type Access,
   APIError,
+  type CollectionBeforeOperationHook,
   type CollectionConfig,
   type CollectionSlug,
   type Condition,
   type Field,
   type FieldHook,
   type FilterOptions,
+  hasDraftsEnabled,
   type PayloadRequest,
   validations,
   type Where,
@@ -25,6 +27,7 @@ import {
   type FieldType,
 } from './definitions'
 import { type CollectionSlugs, entryDefinitionParam } from './entry-list'
+import { hasEntryMatching } from './entry-queries'
 import {
   defaultValue,
   hasStoredValue,
@@ -36,6 +39,9 @@ import {
 } from './entry-values'
 import { normalizePostgresValue, postgresValueFields } from './postgres-fields'
 import { lockDefinition } from './schema-transaction'
+import type { StorageNames } from './storage'
+
+export { hasEntryMatching as hasEntryValueReferences } from './entry-queries'
 
 const entryAdminComponents = {
   arrayField: 'payload-dynamic/react#EntryFields',
@@ -124,8 +130,32 @@ function entryHooks({
   entrySlug,
   uploadCollection,
   scoped,
-}: CollectionSlugs & { uploadCollection?: CollectionSlug; scoped: boolean }) {
+  storage,
+}: CollectionSlugs & {
+  uploadCollection?: CollectionSlug
+  scoped: boolean
+  storage: StorageNames
+}) {
   type Operation = { req: PayloadRequest; overrideAccess: boolean; workspaceID?: ID }
+
+  // Payload loads the latest version for updates by ID and restores, but
+  // bulk writes that are neither drafts nor trash operations start from main.
+  const bulkUpdatesFromMain = new WeakSet<PayloadRequest>()
+  const rememberUpdateSource: CollectionBeforeOperationHook = ({
+    args,
+    collection,
+    operation,
+    req,
+  }) => {
+    if (!hasDraftsEnabled(collection)) return
+    if (operation === 'restoreVersion' || operation === 'create') bulkUpdatesFromMain.delete(req)
+    if (operation !== 'update') return
+    const isBulk = 'where' in args && args.where && !('id' in args && args.id !== undefined)
+    const isTrash =
+      collection.trash && 'deletedAt' in (args.data ?? {}) && args.data?.deletedAt != null
+    if (isBulk && !args.draft && !isTrash) bulkUpdatesFromMain.add(req)
+    else bulkUpdatesFromMain.delete(req)
+  }
 
   // Native relationship controls ask for filters per row during one form-state request.
   const schemas = new WeakMap<PayloadRequest, Map<string, ReturnType<typeof readSchema>>>()
@@ -429,6 +459,7 @@ function entryHooks({
 
   // Field hooks receive the operation's overrideAccess and run before native field validation.
   const prepareValues: FieldHook = async ({
+    collection,
     data,
     originalDoc,
     overrideAccess = false,
@@ -441,13 +472,14 @@ function entryHooks({
     if (id === undefined || (previousID !== undefined && String(id) !== String(previousID))) {
       throw new APIError('Choose a collection when creating an entry. It cannot be changed.', 400)
     }
-    const synchronized = await lockDefinition(req, id)
+    const synchronized = await lockDefinition(req, storage.definitions, id)
     if (synchronized && originalDoc?.id !== undefined) {
       const latest = await req.payload.findByID({
         collection: entrySlug,
         id: originalDoc.id,
         req,
         depth: 0,
+        draft: collection !== null && hasDraftsEnabled(collection) && !bulkUpdatesFromMain.has(req),
         overrideAccess: true,
         showHiddenFields: true,
       })
@@ -467,7 +499,7 @@ function entryHooks({
     })
   }
 
-  return { prepareValues, filterReferences }
+  return { prepareValues, filterReferences, rememberUpdateSource }
 }
 
 // The array's write hook validates relationship scope. The picker uses filterOptions for UI only.
@@ -481,23 +513,65 @@ export function entryCollection({
   entrySlug,
   labels,
   postgres,
+  singletons,
+  storage,
   uploadCollection,
+  versions,
   workspace,
 }: CollectionSlugs & {
   access?: PayloadDynamicAccess
   canManage: Access
   labels?: CollectionConfig['labels']
   postgres: boolean
+  singletons: boolean
+  storage: StorageNames
   uploadCollection?: CollectionSlug
+  versions?: CollectionConfig['versions']
   workspace?: PayloadDynamicWorkspace
 }): CollectionConfig {
-  const { prepareValues, filterReferences } = entryHooks({
+  const { prepareValues, filterReferences, rememberUpdateSource } = entryHooks({
     definitionSlug,
     entrySlug,
     uploadCollection,
     scoped: Boolean(workspace),
+    storage,
   })
   const fieldTypes = availableFieldTypes(postgres).map(({ value }) => value)
+
+  const singletonFields: Field[] = singletons
+    ? [
+        {
+          name: 'singletonKey',
+          type: 'text',
+          unique: true,
+          hidden: true,
+          access: { create: () => false, update: () => false },
+          hooks: {
+            beforeChange: [
+              async ({ data, originalDoc, overrideAccess = false, req }) => {
+                // Resolve the persisted ID so alternate representations of an ID
+                // cannot produce distinct keys for the same collection.
+                const id = referenceID(data?.definition ?? originalDoc?.definition)
+                if (id === undefined) return null
+                const select = { id: true, singleton: true } as const
+                const definition = await req.payload.findByID({
+                  collection: definitionSlug,
+                  id,
+                  req,
+                  depth: 0,
+                  overrideAccess,
+                  disableErrors: true,
+                  select,
+                })
+                return definition && 'singleton' in definition && definition.singleton === true
+                  ? String(definition.id)
+                  : null
+              },
+            ],
+          },
+        },
+      ]
+    : []
 
   function valueFields(depth: number): Field[] {
     const fields: Field[] = [
@@ -615,7 +689,7 @@ export function entryCollection({
       fields.push({
         name: 'rows',
         type: 'array',
-        dbName: `collection_entry_rows_${level}`,
+        dbName: storage.entryRows(level),
         maxRows: 100,
         admin: {
           condition: visibleFor('array', 'group', 'blocks', 'tabs'),
@@ -634,7 +708,7 @@ export function entryCollection({
           {
             name: 'items',
             type: 'array',
-            dbName: `collection_entry_items_${level}`,
+            dbName: storage.entryItems(level),
             maxRows: 100,
             admin: {
               components: {
@@ -654,7 +728,8 @@ export function entryCollection({
   return {
     slug: entrySlug,
     // Keep the SQL table when the public slug changes.
-    dbName: 'collection_entries',
+    dbName: storage.entries,
+    ...(versions !== undefined && { versions }),
     labels: { singular: labels?.singular ?? 'Entry', plural: labels?.plural ?? 'Entries' },
     admin: {
       group: false,
@@ -717,6 +792,7 @@ export function entryCollection({
         access: { update: () => false },
         admin: { hidden: true },
       },
+      ...singletonFields,
       {
         name: 'values',
         type: 'array',
@@ -736,7 +812,10 @@ export function entryCollection({
       },
     ],
     hooks: {
-      ...(workspace && { beforeOperation: [inheritDuplicateScope('definition')] }),
+      beforeOperation: [
+        rememberUpdateSource,
+        ...(workspace ? [inheritDuplicateScope('definition')] : []),
+      ],
       beforeChange: [
         ({ data, operation, originalDoc }) => {
           // Payload strips update-protected fields from version restores before
@@ -749,16 +828,11 @@ export function entryCollection({
       ],
       beforeDelete: [
         async ({ id, req }) => {
-          const { totalDocs } = await req.payload.count({
-            collection: entrySlug,
-            overrideAccess: true,
-            req,
-            where: {
-              id: { not_equals: id },
-              or: entryValueReferences(id, 'relationshipValue', 'relationshipValues'),
-            },
+          const referenced = await hasEntryMatching(req, entrySlug, {
+            id: { not_equals: id },
+            or: entryValueReferences(id, 'relationshipValue', 'relationshipValues'),
           })
-          if (totalDocs) throw new APIError('Another entry still links to this entry.', 409)
+          if (referenced) throw new APIError('Another entry still links to this entry.', 409)
         },
       ],
     },
