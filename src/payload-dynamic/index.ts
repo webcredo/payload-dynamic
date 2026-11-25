@@ -12,7 +12,7 @@ import {
 } from 'payload'
 import type { PayloadDynamicAccess, PayloadDynamicWorkspace } from './access'
 import { definitionCollection, definitionDepth } from './definitions'
-import { entryCollection, entryValueReferences } from './entries'
+import { entryCollection, entryValueReferences, hasEntryValueReferences } from './entries'
 import { createStorageNames, protectStorageNamespace, type StorageNames } from './storage'
 
 // SQL adapters store Array rows in their own table. CollectionConfig.indexes
@@ -94,15 +94,10 @@ const preservePostgresJSONStrings =
 const preventReferencedUploadDeletion =
   (entrySlug: CollectionSlug): CollectionBeforeDeleteHook =>
   async ({ id, req }) => {
-    const { totalDocs } = await req.payload.count({
-      collection: entrySlug,
-      overrideAccess: true,
-      req,
-      where: {
-        or: entryValueReferences(id, 'uploadValue', 'uploadValues'),
-      },
+    const referenced = await hasEntryValueReferences(req, entrySlug, {
+      or: entryValueReferences(id, 'uploadValue', 'uploadValues'),
     })
-    if (totalDocs) throw new APIError('Remove references to this file before deleting it.', 409)
+    if (referenced) throw new APIError('Remove references to this file before deleting it.', 409)
   }
 
 const preventReferencedWorkspaceDeletion =
@@ -134,8 +129,10 @@ export type PayloadDynamicOptions = {
   workspace?: PayloadDynamicWorkspace
   /** Prefix to use for physical SQL storage in a shared database. */
   storagePrefix?: string
+  /** Allow definitions whose entries are limited to one document. */
+  singletons?: boolean
   collections?: CollectionOverrides
-  entries?: CollectionOverrides
+  entries?: CollectionOverrides & Pick<CollectionConfig, 'versions'>
 }
 
 const routeSlug = /^[a-zA-Z0-9_-]+$/
@@ -202,6 +199,7 @@ export function payloadDynamic({
   uploadCollection,
   workspace,
   storagePrefix,
+  singletons = false,
   collections: definitionOptions,
   entries: entryOptions,
   enabled = true,
@@ -229,6 +227,7 @@ export function payloadDynamic({
       ...slugs,
       canManage,
       storage,
+      singletons,
       postgres: config.db.name === 'postgres',
       uploadCollection,
       workspace,
@@ -259,7 +258,12 @@ export function payloadDynamic({
           access: definitionOptions?.access,
           labels: definitionOptions?.labels,
         }),
-        entryCollection({ ...options, access: entryOptions?.access, labels: entryOptions?.labels }),
+        entryCollection({
+          ...options,
+          access: entryOptions?.access,
+          labels: entryOptions?.labels,
+          versions: entryOptions?.versions,
+        }),
       ],
       admin: {
         ...config.admin,

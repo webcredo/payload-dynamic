@@ -198,6 +198,14 @@ async function assertNativeStorage(payload) {
   const entry = payload.collections[entrySlug].config
   const definitionFields = namedField(definition.fields, 'fields')
   const entryValues = namedField(entry.fields, 'values')
+  assert.equal(
+    definition.fields.some(({ name }) => name === 'singleton'),
+    false,
+  )
+  assert.equal(
+    entry.fields.some(({ name }) => name === 'singletonKey'),
+    false,
+  )
   assert.equal(definitionFields.type, 'array')
   assert.equal(entryValues.type, 'array')
   const typeSelect = namedField(definitionFields.fields, 'fieldType')
@@ -1721,6 +1729,313 @@ test('concurrent prefixed initialization preserves shared host callbacks', async
     await Promise.all(instances.map((payload) => payload.destroy()))
   }
 })
+
+for (const [adapter, uri] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `singleton definitions enforce one current entry and retain native versions on ${adapter}`,
+    { skip: adapter === 'PostgreSQL' && !uri },
+    () =>
+      withFixture(
+        async ({ payload, manager, user }) => {
+          const { doc: settings } = await manager('POST', `${definitions}?depth=0`, 201, {
+            title: 'Settings',
+            slug: 'settings',
+            singleton: true,
+            fields: [capacity],
+          })
+          const regular = await createDefinition(manager, 'Regular', 'regular', [capacity])
+          assert.equal(settings.singleton, true)
+          assert.equal(regular.singleton, false)
+          await manager('PATCH', `${definitions}/${settings.id}`, 409, { singleton: false })
+          await manager('PATCH', `${definitions}/${regular.id}`, 409, { singleton: true })
+
+          const results = await Promise.allSettled(
+            ['First', 'Second'].map((title, i) =>
+              payload.create({
+                collection: entrySlug,
+                data: {
+                  title,
+                  definition: settings.id,
+                  singletonKey: `untrusted-${i}`,
+                  values: [{ fieldKey: 'capacity', numberValue: 123 }],
+                },
+                depth: 0,
+                overrideAccess: false,
+                user,
+              }),
+            ),
+          )
+          const successes = results.filter((result) => result.status === 'fulfilled')
+          assert.equal(successes.length, 1)
+          const duplicate = results.find((result) => result.status === 'rejected')
+          assert.ok(duplicate)
+          assert.match(JSON.stringify(duplicate.reason), /unique/i)
+          const original = successes[0].value
+          const reread = await payload.findByID({
+            collection: entrySlug,
+            id: original.id,
+            depth: 0,
+            showHiddenFields: true,
+            overrideAccess: true,
+          })
+          assert.equal(reread.singletonKey, String(settings.id))
+
+          // Adapter writes bypass hooks. The table must independently reject
+          // writing another row with the same key.
+          await assert.rejects(
+            payload.db.create({
+              collection: entrySlug,
+              data: {
+                title: 'Duplicate raw key',
+                definition: settings.id,
+                singletonKey: String(settings.id),
+              },
+            }),
+            (error) => /unique/i.test(JSON.stringify(error)),
+          )
+          await manager('POST', `${entries}/${original.id}/duplicate?depth=0`, 400, {})
+
+          const baseline = await manager('GET', `${entries}/versions?depth=0`, 200)
+          const version = baseline.docs.find(({ parent }) => parent === original.id)
+          assert.ok(version)
+          const { doc: modified } = await manager(
+            'PATCH',
+            `${entries}/${original.id}?depth=0`,
+            200,
+            {
+              title: 'Modified',
+              definition: regular.id,
+              singletonKey: null,
+              values: [{ fieldKey: 'capacity', numberValue: 456 }],
+            },
+          )
+          assert.equal(modified.definition, settings.id)
+          assert.equal(value(modified, 'capacity', 'numberValue'), 456)
+          await assert.rejects(
+            payload.update({
+              collection: entrySlug,
+              id: original.id,
+              data: { definition: regular.id },
+              overrideAccess: true,
+            }),
+            /cannot be changed/,
+          )
+
+          const restored = await manager('POST', `${entries}/versions/${version.id}?depth=0`, 200)
+          assert.equal(restored.id, original.id)
+          assert.equal(restored.definition, settings.id)
+          assert.equal(restored.title, original.title)
+          assert.equal(value(restored, 'capacity', 'numberValue'), 123)
+          await manager('POST', entries, 400, {
+            title: 'Duplicate after restore',
+            definition: settings.id,
+          })
+
+          const first = await createEntry(manager, 'Regular first', regular.id, [])
+          const second = await createEntry(manager, 'Regular second', regular.id, [])
+          assert.notEqual(first.id, second.id)
+          const counts = await Promise.all(
+            [settings, regular].map(({ id }) =>
+              payload.count({
+                collection: entrySlug,
+                where: { definition: { equals: id } },
+                overrideAccess: true,
+              }),
+            ),
+          )
+          assert.deepEqual(
+            counts.map(({ totalDocs }) => totalDocs),
+            [1, 2],
+          )
+        },
+        uri,
+        { singletons: true, storagePrefix: 'oneonly' },
+      ),
+  )
+}
+
+const entryDrafts = { entries: { versions: { drafts: true, maxPerDoc: 0 } } }
+
+for (const [adapter, uri] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `singleton drafts publish to the same native ID on ${adapter}`,
+    { skip: adapter === 'PostgreSQL' && !uri },
+    () =>
+      withFixture(
+        async ({ payload, manager }) => {
+          assert.equal(payload.collections[entrySlug].config.versions.maxPerDoc, 0)
+          const { doc: settings } = await manager('POST', `${definitions}?depth=0`, 201, {
+            title: 'Draft settings',
+            slug: 'draft-settings',
+            singleton: true,
+            fields: [capacity],
+          })
+          const { doc: draft } = await manager('POST', `${entries}?draft=true&depth=0`, 201, {
+            title: 'Unpublished',
+            definition: settings.id,
+            values: [{ fieldKey: 'capacity', numberValue: 12 }],
+          })
+          assert.equal(draft._status, 'draft')
+          await manager('POST', `${entries}?draft=true&depth=0`, 400, {
+            title: 'Second draft',
+            definition: settings.id,
+          })
+
+          const { doc: published } = await manager('PATCH', `${entries}/${draft.id}?depth=0`, 200, {
+            title: 'Published',
+            _status: 'published',
+            values: [{ fieldKey: 'capacity', numberValue: 34 }],
+          })
+          assert.equal(published.id, draft.id)
+          assert.equal(published._status, 'published')
+          assert.equal(value(published, 'capacity', 'numberValue'), 34)
+          const { doc: pending } = await manager(
+            'PATCH',
+            `${entries}/${draft.id}?draft=true&depth=0`,
+            200,
+            { title: 'Next draft', values: [{ fieldKey: 'capacity', numberValue: 56 }] },
+          )
+          assert.equal(pending.id, draft.id)
+          assert.equal(value(pending, 'capacity', 'numberValue'), 56)
+
+          const live = await manager('GET', `${entries}/${draft.id}?draft=false&depth=0`, 200)
+          assert.equal(live.title, 'Published')
+          assert.equal(value(live, 'capacity', 'numberValue'), 34)
+          const { doc: nextDraft } = await manager(
+            'PATCH',
+            `${entries}/${draft.id}?draft=true&depth=0`,
+            200,
+            { title: 'Second save', values: [{ fieldKey: 'capacity', numberValue: 67 }] },
+          )
+          assert.equal(nextDraft.id, draft.id)
+          assert.equal(value(nextDraft, 'capacity', 'numberValue'), 67)
+
+          const { doc: republished } = await manager(
+            'PATCH',
+            `${entries}/${draft.id}?depth=0`,
+            200,
+            { _status: 'published' },
+          )
+          assert.equal(republished.id, draft.id)
+          assert.equal(value(republished, 'capacity', 'numberValue'), 67)
+          await manager('PATCH', `${entries}/${draft.id}?draft=true&depth=0`, 200, {
+            title: 'Pending restore',
+            values: [{ fieldKey: 'capacity', numberValue: 84 }],
+          })
+          const { docs } = await manager('GET', `${entries}/versions?depth=0`, 200)
+          const earlier = docs.find(({ version }) => version.title === 'Published')
+          assert.ok(earlier)
+          const restored = await manager('POST', `${entries}/versions/${earlier.id}?depth=0`, 200)
+          assert.equal(restored.id, draft.id)
+          assert.equal(restored._status, 'published')
+          assert.equal(value(restored, 'capacity', 'numberValue'), 34)
+
+          // Bulk writes without the draft flag start from the published
+          // document even when Payload also has a newer pending draft.
+          await manager('PATCH', `${entries}/${draft.id}?draft=true&depth=0`, 200, {
+            title: 'Pending bulk',
+            values: [{ fieldKey: 'capacity', numberValue: 91 }],
+          })
+          const where = new URLSearchParams({ 'where[id][equals]': String(draft.id), depth: '0' })
+          const { docs: updated } = await manager('PATCH', `${entries}?${where}`, 200, {
+            title: 'Bulk title',
+          })
+          assert.equal(updated.length, 1)
+          assert.equal(value(updated[0], 'capacity', 'numberValue'), 34)
+
+          assert.ok(docs.length >= 6)
+          assert.ok(docs.every(({ parent }) => parent === draft.id))
+          assert.ok(
+            docs.some(
+              ({ version }) => version._status === 'draft' && version.title === 'Next draft',
+            ),
+          )
+          await manager('POST', entries, 400, {
+            title: 'Another live entry',
+            definition: settings.id,
+          })
+          const { totalDocs } = await payload.count({
+            collection: entrySlug,
+            where: { definition: { equals: settings.id } },
+            overrideAccess: true,
+          })
+          assert.equal(totalDocs, 1)
+        },
+        uri,
+        { ...entryDrafts, singletons: true, storagePrefix: 'oneonly' },
+        [],
+        true,
+      ),
+  )
+}
+
+for (const [adapter, uri] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `draft-only entry and media references block deletion on ${adapter}`,
+    { skip: adapter === 'PostgreSQL' && !uri },
+    () =>
+      withFixture(
+        async ({ payload, manager, user }) => {
+          const targetDefinition = await createDefinition(manager, 'Targets', 'targets', [capacity])
+          const target = await createEntry(manager, 'Linked entry', targetDefinition.id, [])
+          const file = Buffer.from('Draft-only upload')
+          const upload = await payload.create({
+            collection: 'media',
+            user,
+            overrideAccess: false,
+            data: {},
+            file: { name: 'draft-only.txt', mimetype: 'text/plain', data: file, size: file.length },
+          })
+          const owner = await createDefinition(manager, 'Owners', 'owners', [
+            { key: 'link', fieldType: 'relationship', targetDefinition: targetDefinition.id },
+            { key: 'upload', fieldType: 'upload' },
+          ])
+          const published = await createEntry(manager, 'Reference owner', owner.id, [])
+          const draftURL = `${entries}/${published.id}?draft=true&depth=0`
+          const linkedValues = [
+            { fieldKey: 'link', relationshipValue: target.id },
+            { fieldKey: 'upload', uploadValue: upload.id },
+          ]
+          const { doc: draft } = await manager('PATCH', draftURL, 200, {
+            values: linkedValues,
+          })
+          assert.equal(value(draft, 'link', 'relationshipValue'), target.id)
+          assert.equal(value(draft, 'upload', 'uploadValue'), upload.id)
+          const live = await manager('GET', `${entries}/${published.id}?draft=false&depth=0`, 200)
+          assert.equal(value(live, 'link', 'relationshipValue'), null)
+          assert.equal(value(live, 'upload', 'uploadValue'), null)
+          await manager('DELETE', `${entries}/${target.id}`, 409)
+          await manager('DELETE', `/api/media/${upload.id}`, 409)
+
+          await manager('PATCH', `${entries}/${published.id}?depth=0`, 200, {
+            _status: 'published',
+          })
+          await manager('PATCH', draftURL, 200, {
+            values: [
+              { fieldKey: 'link', relationshipValue: null },
+              { fieldKey: 'upload', uploadValue: null },
+            ],
+          })
+          // A draft clearing a reference must not hide the live reference.
+          await manager('DELETE', `${entries}/${target.id}`, 409)
+          await manager('DELETE', `/api/media/${upload.id}`, 409)
+        },
+        uri,
+        entryDrafts,
+        [],
+        true,
+      ),
+  )
+}
 
 test(
   'JSON and Rich Text work in PostgreSQL through the Local and REST APIs',

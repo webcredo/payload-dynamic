@@ -583,6 +583,7 @@ export function definitionCollection({
   entrySlug,
   labels,
   postgres,
+  singletons,
   storage,
   uploadCollection,
   workspace,
@@ -591,6 +592,7 @@ export function definitionCollection({
   canManage: Access
   labels?: CollectionConfig['labels']
   postgres: boolean
+  singletons: boolean
   storage: StorageNames
   uploadCollection?: string
   workspace?: PayloadDynamicWorkspace
@@ -613,6 +615,18 @@ export function definitionCollection({
           },
           validate: validateWorkspace,
           admin: { allowCreate: false, description: 'Fixed after the collection is created.' },
+        },
+      ]
+    : []
+
+  const singletonFields: Field[] = singletons
+    ? [
+        {
+          name: 'singleton',
+          type: 'checkbox',
+          defaultValue: false,
+          label: 'Single entry',
+          admin: { description: 'Allow at most one entry. Fixed after creation.' },
         },
       ]
     : []
@@ -667,6 +681,7 @@ export function definitionCollection({
         },
       },
       ...workspaceFields,
+      ...singletonFields,
       {
         name: 'fields',
         type: 'array',
@@ -699,6 +714,15 @@ export function definitionCollection({
             if (String(referenceID(data.workspace)) !== String(previous)) {
               throw new APIError('The workspace is fixed after the collection is created.', 409)
             }
+          }
+          if (
+            singletons &&
+            operation === 'update' &&
+            originalDoc &&
+            data.singleton !== undefined &&
+            (data.singleton === true) !== (originalDoc.singleton === true)
+          ) {
+            throw new APIError('Single entry is fixed after the collection is created.', 409)
           }
           if (data.fields === undefined) return data
           const fields = await normalizeFields(data.fields, req, types)
