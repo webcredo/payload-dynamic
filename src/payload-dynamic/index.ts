@@ -11,8 +11,9 @@ import {
   type Plugin,
 } from 'payload'
 import type { PayloadDynamicAccess, PayloadDynamicWorkspace } from './access'
-import { definitionCollection, definitionDepth } from './definitions'
+import { definitionCollection } from './definitions'
 import { entryCollection, entryValueReferences, hasEntryValueReferences } from './entries'
+import { defaultNestingDepth } from './nesting-layout'
 import { createStorageNames, protectStorageNamespace, type StorageNames } from './storage'
 import {
   assertUploadWorkspaceField,
@@ -26,10 +27,18 @@ import {
   versionRetentionField,
 } from './version-retention'
 
+export {
+  decodePayloadDynamicDefinitionFields,
+  decodePayloadDynamicEntryValues,
+  encodePayloadDynamicDefinitionFields,
+  encodePayloadDynamicEntryValues,
+} from './nesting-layout'
+
 // SQL adapters store Array rows in their own table. CollectionConfig.indexes
 // applies to the parent table; this index covers a range on a single field key.
 function prepareNativeCollectionSchema<Schema>(
   storage: StorageNames,
+  maxNestingDepth: number,
   {
     adapter,
     schema,
@@ -52,7 +61,7 @@ function prepareNativeCollectionSchema<Schema>(
     }
   }
 
-  // Drizzle must distinguish the parent and child links when both arrays are named fields.
+  // Drizzle must distinguish the parent and child links when the arrays share a field name.
   if (adapter) {
     const { rawRelations, rawTables, versionsSuffix = '_v' } = adapter
     // The definition hook supplies a label before saving, including when the form leaves it blank.
@@ -64,7 +73,7 @@ function prepareNativeCollectionSchema<Schema>(
       if (label) label.notNull = true
     }
 
-    for (let depth = 1; depth <= definitionDepth; depth++) {
+    for (let depth = 1; depth <= maxNestingDepth; depth++) {
       const tableName = storage.nestedDefinitions(depth)
       for (const child of [tableName, `_${tableName}${versionsSuffix}`]) {
         const toParent = rawRelations[child]?._parentID
@@ -83,11 +92,11 @@ function prepareNativeCollectionSchema<Schema>(
 }
 
 const preservePostgresJSONStrings =
-  (storage: StorageNames): PostgresAdapter['afterSchemaInit'][number] =>
+  (storage: StorageNames, maxNestingDepth: number): PostgresAdapter['afterSchemaInit'][number] =>
   ({ adapter, schema }) => {
     const suffix = adapter.versionsSuffix ?? '_v'
     const tables = [`${storage.entries}_values`, `_${storage.entries}${suffix}_version_values`]
-    for (let depth = 1; depth <= definitionDepth; depth++) {
+    for (let depth = 1; depth <= maxNestingDepth; depth++) {
       const table = storage.entryItems(depth)
       tables.push(table, `_${table}${suffix}`)
     }
@@ -103,9 +112,14 @@ const preservePostgresJSONStrings =
   }
 
 const preventReferencedUploadDeletion =
-  (entrySlug: CollectionSlug, storage: StorageNames, scoped: boolean): CollectionBeforeDeleteHook =>
+  (
+    entrySlug: CollectionSlug,
+    storage: StorageNames,
+    scoped: boolean,
+    maxNestingDepth: number,
+  ): CollectionBeforeDeleteHook =>
   async ({ collection, id, req }) => {
-    const paths = entryValueReferences(id, 'uploadValue', 'uploadValues')
+    const paths = entryValueReferences(id, maxNestingDepth, 'uploadValue', 'uploadValues')
     const conflict = () => new APIError('Remove references to this file before deleting it.', 409)
     if (scoped && !(await lockScopedUploads(req, collection.slug, [id], 'delete'))) return
     if (await hasEntryValueReferences(req, entrySlug, { or: paths })) throw conflict()
@@ -126,7 +140,7 @@ const preventReferencedUploadDeletion =
       })
       if (docs.length) throw conflict()
     }
-    if (await hasRichTextUploadReference(req, storage, definitionDepth, collection.slug, id)) {
+    if (await hasRichTextUploadReference(req, storage, maxNestingDepth, collection.slug, id)) {
       throw conflict()
     }
   }
@@ -162,6 +176,8 @@ export type PayloadDynamicOptions = {
   workspace?: PayloadDynamicWorkspace
   /** Prefix to use for physical SQL storage in a shared database. */
   storagePrefix?: string
+  /** Definition nesting limit. Depths above two use the compact PostgreSQL layout. */
+  maxNestingDepth?: number
   /** Allow definitions whose entries are limited to one document. */
   singletons?: boolean
   collections?: CollectionOverrides
@@ -241,6 +257,7 @@ export function payloadDynamic({
   uploadWorkspaceField,
   workspace,
   storagePrefix,
+  maxNestingDepth = defaultNestingDepth,
   singletons = false,
   collections: definitionOptions,
   entries: entryOptions,
@@ -248,6 +265,13 @@ export function payloadDynamic({
 }: PayloadDynamicOptions): Plugin {
   return (config) => {
     if (!enabled) return config
+    if (
+      !Number.isInteger(maxNestingDepth) ||
+      maxNestingDepth < defaultNestingDepth ||
+      maxNestingDepth > 6
+    ) {
+      throw new Error('payload-dynamic maxNestingDepth must be an integer between 2 and 6.')
+    }
     const collections = config.collections ?? []
     const definitionSlug = (definitionOptions?.slug ?? 'collections') as CollectionSlug
     const entrySlug = (entryOptions?.slug ?? 'entries') as CollectionSlug
@@ -277,6 +301,10 @@ export function payloadDynamic({
     ) {
       throw new Error('retentionByDefinition requires entries.versions.maxPerDoc to be zero.')
     }
+    const postgres = config.db.name === 'postgres'
+    if (maxNestingDepth > defaultNestingDepth && !postgres) {
+      throw new Error('payload-dynamic maxNestingDepth above 2 requires PostgreSQL.')
+    }
 
     const slugs = { definitionSlug, entrySlug }
     const options = {
@@ -284,7 +312,8 @@ export function payloadDynamic({
       canManage,
       storage,
       singletons,
-      postgres: config.db.name === 'postgres',
+      maxNestingDepth,
+      postgres,
       uploadCollection,
       uploadWorkspaceField,
       workspace,
@@ -293,7 +322,14 @@ export function payloadDynamic({
       const guards: CollectionBeforeDeleteHook[] = []
       const uploadScope = collection.slug === uploadCollection ? uploadWorkspaceField : undefined
       if (collection.slug === uploadCollection)
-        guards.push(preventReferencedUploadDeletion(entrySlug, storage, uploadScope !== undefined))
+        guards.push(
+          preventReferencedUploadDeletion(
+            entrySlug,
+            storage,
+            uploadScope !== undefined,
+            maxNestingDepth,
+          ),
+        )
       if (collection.slug === workspace?.collection) {
         guards.push(preventReferencedWorkspaceDeletion(definitionSlug))
       }
@@ -367,17 +403,27 @@ export function payloadDynamic({
             const sqlite = adapter as SQLiteAdapter
             sqlite.beforeSchemaInit = [
               ...sqlite.beforeSchemaInit,
-              (args) => prepareNativeCollectionSchema(storage, args),
+              (args) => prepareNativeCollectionSchema(storage, maxNestingDepth, args),
             ]
           } else if (adapter.name === 'postgres') {
             const postgres = adapter as PostgresAdapter
+            if (maxNestingDepth > defaultNestingDepth) {
+              const suffix = postgres.versionsSuffix ?? '_v'
+              const entryAlias = `_${storage.entries}${suffix}_version_values${'_r_i'.repeat(maxNestingDepth)}_u`
+              const definitionAlias = `_${storage.definitions}${suffix}_version_fields${'_f'.repeat(maxNestingDepth)}_options`
+              if ([entryAlias, definitionAlias].some((alias) => Buffer.byteLength(alias) > 63)) {
+                throw new Error(
+                  'The compact SQL layout requires a shorter storagePrefix or versionsSuffix.',
+                )
+              }
+            }
             postgres.beforeSchemaInit = [
               ...postgres.beforeSchemaInit,
-              (args) => prepareNativeCollectionSchema(storage, args),
+              (args) => prepareNativeCollectionSchema(storage, maxNestingDepth, args),
             ]
             postgres.afterSchemaInit = [
               ...postgres.afterSchemaInit,
-              preservePostgresJSONStrings(storage),
+              preservePostgresJSONStrings(storage, maxNestingDepth),
             ]
           }
           return adapter

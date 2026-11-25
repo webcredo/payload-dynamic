@@ -1,6 +1,6 @@
 {
   "name": "payload-dynamic",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Native runtime-defined collections for Payload CMS (SQLite and PostgreSQL)",
   "license": "MIT",
   "repository": {
@@ -58,7 +58,7 @@
     "preimportmap": "npm run build",
     "importmap": "payload generate:importmap",
     "types": "payload generate:types",
-    "test:collections": "node --import tsx --test tests/payload-dynamic.test.mjs",
+    "test:collections": "node --import tsx --test --test-concurrency=1 tests/payload-dynamic.test.mjs tests/deep-nesting.test.mjs",
     "test:package": "node --test tests/package.test.mjs"
   },
   "peerDependencies": {

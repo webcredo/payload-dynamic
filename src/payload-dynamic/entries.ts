@@ -21,12 +21,7 @@ import {
   type PayloadDynamicAccess,
   type PayloadDynamicWorkspace,
 } from './access'
-import {
-  availableFieldTypes,
-  type DefinitionField,
-  definitionDepth,
-  type FieldType,
-} from './definitions'
+import { availableFieldTypes, type DefinitionField, type FieldType } from './definitions'
 import { type CollectionSlugs, entryDefinitionParam } from './entry-list'
 import { hasEntryMatching } from './entry-queries'
 import {
@@ -41,6 +36,13 @@ import {
   valueColumn,
   valuePresenceOptions,
 } from './entry-values'
+import {
+  decodePayloadDynamicDefinitionFields,
+  decodePayloadDynamicEntryValues,
+  encodePayloadDynamicEntryValues,
+  nestingAliases,
+  storageValueColumn,
+} from './nesting-layout'
 import { normalizePostgresValue, postgresValueFields } from './postgres-fields'
 import { lockDefinition } from './schema-transaction'
 import type { StorageNames } from './storage'
@@ -105,11 +107,16 @@ function findField(fields: DefinitionField[], path: string) {
 
 export function entryValueReferences(
   id: ID,
+  maxNestingDepth: number,
   ...columns: ('relationshipValue' | 'relationshipValues' | 'uploadValue' | 'uploadValues')[]
 ): Where[] {
-  return Array.from({ length: definitionDepth + 1 }, (_, depth) =>
+  const names = nestingAliases(maxNestingDepth)
+  return Array.from({ length: maxNestingDepth + 1 }, (_, depth) =>
     columns.map((column) => ({
-      [`values${'.rows.items'.repeat(depth)}.${column}`]: { equals: id },
+      [`values${`.${names.rows}.${names.items}`.repeat(depth)}.${storageValueColumn(column, names)}`]:
+        {
+          equals: id,
+        },
     })),
   ).flat()
 }
@@ -118,6 +125,7 @@ function readSchema(
   req: PayloadRequest,
   definitionSlug: CollectionSlug,
   id: ID,
+  maxNestingDepth: number,
   overrideAccess = false,
 ) {
   return req.payload
@@ -132,7 +140,10 @@ function readSchema(
     .then((doc) =>
       doc && 'fields' in doc && Array.isArray(doc.fields)
         ? {
-            fields: doc.fields as DefinitionField[],
+            fields: decodePayloadDynamicDefinitionFields(
+              doc.fields,
+              maxNestingDepth,
+            ) as DefinitionField[],
             workspaceID: 'workspace' in doc ? referenceID(doc.workspace) : undefined,
           }
         : undefined,
@@ -142,6 +153,7 @@ function readSchema(
 function entryHooks({
   definitionSlug,
   entrySlug,
+  maxNestingDepth,
   uploadCollection,
   uploadWorkspaceField,
   scoped,
@@ -149,6 +161,7 @@ function entryHooks({
   stableRowKeys,
   storage,
 }: CollectionSlugs & {
+  maxNestingDepth: number
   uploadCollection?: CollectionSlug
   uploadWorkspaceField?: string
   scoped: boolean
@@ -188,7 +201,7 @@ function entryHooks({
     const key = String(id)
     let pending = byID.get(key)
     if (!pending) {
-      pending = readSchema(req, definitionSlug, id)
+      pending = readSchema(req, definitionSlug, id, maxNestingDepth)
       byID.set(key, pending)
     }
     return pending
@@ -587,15 +600,18 @@ function entryHooks({
         throw new APIError('The entry values changed. Reload the entry before saving.', 409)
       }
     }
-    const schema = await readSchema(req, definitionSlug, id, overrideAccess)
+    const schema = await readSchema(req, definitionSlug, id, maxNestingDepth, overrideAccess)
     if (!schema || (scoped && schema.workspaceID === undefined)) {
       throw new APIError('Collection definition is unavailable.', 400)
     }
-    return normalizeValues(schema.fields, value, originalDoc?.values ?? [], '', {
-      req,
-      overrideAccess,
-      workspaceID: schema.workspaceID,
-    })
+    const normalized = await normalizeValues(
+      schema.fields,
+      decodePayloadDynamicEntryValues(value, maxNestingDepth),
+      decodePayloadDynamicEntryValues(originalDoc?.values ?? [], maxNestingDepth) as ValueRow[],
+      '',
+      { req, overrideAccess, workspaceID: schema.workspaceID },
+    )
+    return encodePayloadDynamicEntryValues(normalized, maxNestingDepth)
   }
 
   return { prepareValues, filterReferences, rememberUpdateSource }
@@ -614,6 +630,7 @@ export function entryCollection({
   definitionSlug,
   entrySlug,
   labels,
+  maxNestingDepth,
   postgres,
   preserveValuePresence = false,
   singletons,
@@ -627,6 +644,7 @@ export function entryCollection({
   access?: PayloadDynamicAccess
   canManage: Access
   labels?: CollectionConfig['labels']
+  maxNestingDepth: number
   postgres: boolean
   preserveValuePresence?: boolean
   singletons: boolean
@@ -637,9 +655,11 @@ export function entryCollection({
   versions?: CollectionConfig['versions']
   workspace?: PayloadDynamicWorkspace
 }): CollectionConfig {
+  const names = nestingAliases(maxNestingDepth)
   const { prepareValues, filterReferences, rememberUpdateSource } = entryHooks({
     definitionSlug,
     entrySlug,
+    maxNestingDepth,
     uploadCollection,
     uploadWorkspaceField,
     scoped: Boolean(workspace),
@@ -753,7 +773,7 @@ export function entryCollection({
         },
       },
       {
-        name: 'relationshipValue',
+        name: names.relationshipValue,
         type: 'relationship',
         label: 'Related entry',
         relationTo: entrySlug,
@@ -795,7 +815,7 @@ export function entryCollection({
             }
       fields.push(
         {
-          name: 'uploadValue',
+          name: names.uploadValue,
           type: 'upload',
           label: 'File value',
           relationTo: uploadCollection,
@@ -813,10 +833,10 @@ export function entryCollection({
         },
       )
     }
-    if (depth < definitionDepth) {
+    if (depth < maxNestingDepth) {
       const level = depth + 1
       fields.push({
-        name: 'rows',
+        name: names.rows,
         type: 'array',
         dbName: storage.entryRows(level),
         maxRows: 100,
@@ -825,7 +845,7 @@ export function entryCollection({
           components: {
             Field: {
               path: entryAdminComponents.nestedRowsField,
-              clientProps: { preserveValuePresence, stableRowKeys },
+              clientProps: { preserveValuePresence, stableRowKeys, maxNestingDepth },
             },
             RowLabel: entryAdminComponents.nestedRowLabel,
           },
@@ -841,7 +861,7 @@ export function entryCollection({
             admin: { components: { Field: entryAdminComponents.blockTypeField } },
           },
           {
-            name: 'items',
+            name: names.items,
             type: 'array',
             dbName: storage.entryItems(level),
             maxRows: 100,
@@ -936,7 +956,7 @@ export function entryCollection({
           components: {
             Field: {
               path: entryAdminComponents.arrayField,
-              clientProps: { definitionSlug, entrySlug, preserveValuePresence },
+              clientProps: { definitionSlug, entrySlug, preserveValuePresence, maxNestingDepth },
             },
             RowLabel: entryAdminComponents.rowLabel,
           },
@@ -965,7 +985,12 @@ export function entryCollection({
         async ({ id, req }) => {
           const referenced = await hasEntryMatching(req, entrySlug, {
             id: { not_equals: id },
-            or: entryValueReferences(id, 'relationshipValue', 'relationshipValues'),
+            or: entryValueReferences(
+              id,
+              maxNestingDepth,
+              'relationshipValue',
+              'relationshipValues',
+            ),
           })
           if (referenced) throw new APIError('Another entry still links to this entry.', 409)
         },

@@ -29,13 +29,26 @@ import {
   referenceID,
   valueColumn,
 } from './entry-values'
+import {
+  decodePayloadDynamicDefinitionFields,
+  decodePayloadDynamicEntryValues,
+  defaultNestingDepth,
+  nestingAliases,
+  storageValueColumn,
+} from './nesting-layout'
 
 type Definition = { fields: DefinitionField[]; title: string }
 type LoadResult = ({ id: string } & Definition) | { id: string; error: true }
 
 const DefinitionFields = createContext<ReadonlyMap<string, DefinitionField> | undefined>(undefined)
 const NestedDefinition = createContext<
-  { field: DefinitionField; fieldPath: string; preserveValuePresence: boolean } | undefined
+  | {
+      field: DefinitionField
+      fieldPath: string
+      preserveValuePresence: boolean
+      maxNestingDepth: number
+    }
+  | undefined
 >(undefined)
 
 function useValueDefinition(fallbackPath: string) {
@@ -221,10 +234,15 @@ export function NestedEntryRowLabel() {
 }
 
 export function NestedValueField({
+  maxNestingDepth = defaultNestingDepth,
   preserveValuePresence = false,
   stableRowKeys = false,
   ...props
-}: ArrayFieldClientProps & { preserveValuePresence?: boolean; stableRowKeys?: boolean }) {
+}: ArrayFieldClientProps & {
+  preserveValuePresence?: boolean
+  stableRowKeys?: boolean
+  maxNestingDepth?: number
+}) {
   const { definition, fieldPath, path } = useValueDefinition(props.path)
   const { addFieldRow, dispatchFields, getDataByPath, removeFieldRow } = useForm()
   const { disabled, rows } = useField({ hasRows: true, potentiallyStalePath: path })
@@ -265,14 +283,17 @@ export function NestedValueField({
   }, [disabled, dispatchFields, isFixed, path, readOnly, rows, siblingKeys, stableRowKeys])
 
   if (!definition || (!isFixed && type !== 'array' && type !== 'blocks')) return null
+  const names = nestingAliases(maxNestingDepth)
   return (
-    <NestedDefinition.Provider value={{ field: definition, fieldPath, preserveValuePresence }}>
+    <NestedDefinition.Provider
+      value={{ field: definition, fieldPath, preserveValuePresence, maxNestingDepth }}
+    >
       {isFixed ? (
         <>
           {firstRow && !firstRow.isLoading && (
             <RenderFields
               fields={props.field.fields.filter(
-                (field) => 'name' in field && field.name === 'items',
+                (field) => 'name' in field && field.name === names.items,
               )}
               parentIndexPath=""
               parentPath={`${path}.0`}
@@ -398,6 +419,7 @@ export function EntryValueArray(props: ArrayFieldClientProps) {
             key={row.id}
             path={itemPath}
             props={props}
+            maxNestingDepth={nested?.maxNestingDepth ?? defaultNestingDepth}
             tab={isTabs ? tab?.key : undefined}
             tabsID={tabsID}
           />
@@ -408,11 +430,13 @@ export function EntryValueArray(props: ArrayFieldClientProps) {
 }
 
 function NestedItem({
+  maxNestingDepth,
   path,
   props,
   tab,
   tabsID,
 }: {
+  maxNestingDepth: number
   path: string
   props: ArrayFieldClientProps
   tab?: string
@@ -422,7 +446,7 @@ function NestedItem({
   const definition = useContext(DefinitionFields)?.get(String(key))
   if (!definition) return null
 
-  const column = valueColumn(definition)
+  const column = storageValueColumn(valueColumn(definition), nestingAliases(maxNestingDepth))
   const inputs = (
     <RenderFields
       fields={props.field.fields.filter((field) => 'name' in field && field.name === column)}
@@ -453,11 +477,13 @@ function NestedItem({
 export function EntryFields({
   definitionSlug,
   entrySlug,
+  maxNestingDepth = defaultNestingDepth,
   preserveValuePresence = false,
   ...array
 }: ArrayFieldClientProps & {
   definitionSlug: string
   entrySlug: string
+  maxNestingDepth?: number
   preserveValuePresence?: boolean
 }) {
   const { config } = useConfig()
@@ -492,14 +518,23 @@ export function EntryFields({
           },
         )
         if (!response.ok) throw new Error('Collection definition could not be loaded.')
-        const schema: Definition = await response.json()
+        const stored: Definition = await response.json()
+        const schema = {
+          ...stored,
+          fields: decodePayloadDynamicDefinitionFields(
+            stored.fields,
+            maxNestingDepth,
+          ) as DefinitionField[],
+        }
         const currentID = referenceID(getDataByPath('definition'))
         if (controller.signal.aborted || currentID === undefined || current !== String(currentID))
           return
 
         if (!readOnly) {
-          const existing =
-            getDataByPath<({ fieldKey: string } & Record<string, unknown>)[]>(path) ?? []
+          const existing = decodePayloadDynamicEntryValues(
+            getDataByPath(path) ?? [],
+            maxNestingDepth,
+          ) as Array<{ fieldKey: string } & Record<string, unknown>>
           const byKey = new Map(schema.fields.map((field) => [field.key, field]))
           for (let rowIndex = existing.length - 1; rowIndex >= 0; rowIndex--) {
             const row = existing[rowIndex]
@@ -554,6 +589,7 @@ export function EntryFields({
     dispatchFields,
     getDataByPath,
     id,
+    maxNestingDepth,
     path,
     preserveValuePresence,
     readOnly,

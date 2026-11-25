@@ -21,6 +21,12 @@ import {
 import type { CollectionSlugs } from './entry-list'
 import { hasEntryMatching } from './entry-queries'
 import { hasStoredValue, normalizeDate, referenceID } from './entry-values'
+import {
+  decodePayloadDynamicDefinitionFields,
+  decodePayloadDynamicEntryValues,
+  encodePayloadDynamicDefinitionFields,
+  nestingAliases,
+} from './nesting-layout'
 import { lockDefinition } from './schema-transaction'
 import type { StorageNames } from './storage'
 
@@ -46,8 +52,6 @@ const fieldTypeOptions = [
 ] as const
 
 export type FieldType = (typeof fieldTypeOptions)[number]['value']
-export const definitionDepth = 2
-
 export function availableFieldTypes(postgres: boolean) {
   return fieldTypeOptions.filter(
     ({ value }) => postgres || (value !== 'json' && value !== 'richText'),
@@ -88,8 +92,8 @@ function hasSections(type: FieldType) {
   return type === 'blocks' || type === 'tabs'
 }
 
-function fitsDepth(type: FieldType, depth: number) {
-  return !structureTypes.includes(type) || depth + (hasSections(type) ? 2 : 1) <= definitionDepth
+function fitsDepth(type: FieldType, depth: number, maxNestingDepth: number) {
+  return !structureTypes.includes(type) || depth + (hasSections(type) ? 2 : 1) <= maxNestingDepth
 }
 
 const onlyFor =
@@ -284,6 +288,7 @@ async function normalizeFields(
   fields: unknown,
   req: PayloadRequest,
   types: Set<FieldType>,
+  maxNestingDepth: number,
   depth = 0,
   sectionsOnly = false,
 ): Promise<DefinitionField[]> {
@@ -302,7 +307,7 @@ async function normalizeFields(
     ) {
       throw new APIError('Provide a unique lowercase key for every field in a section.', 400)
     }
-    if (!types.has(input.fieldType) || !fitsDepth(input.fieldType, depth)) {
+    if (!types.has(input.fieldType) || !fitsDepth(input.fieldType, depth, maxNestingDepth)) {
       throw new APIError(`Choose a supported field type for ${input.key} at this level.`, 400)
     }
     if (sectionsOnly && input.fieldType !== 'group') {
@@ -330,11 +335,12 @@ async function normalizeFields(
         field.fields,
         req,
         types,
+        maxNestingDepth,
         depth + 1,
         hasSections(field.fieldType),
       )
     } else {
-      field.fields = depth < definitionDepth ? [] : undefined
+      field.fields = depth < maxNestingDepth ? [] : undefined
     }
     current.add(field.key)
     normalized.push(normalizeSettings(field))
@@ -363,6 +369,7 @@ async function assertSafeFieldChanges(
   previous: DefinitionField[],
   current: DefinitionField[],
   synchronized: boolean,
+  maxNestingDepth: number,
 ) {
   const where = { definition: { equals: id } }
   if (!(await hasEntryMatching(req, entrySlug, where))) return
@@ -427,7 +434,9 @@ async function assertSafeFieldChanges(
           throw new APIError('Could not verify current entry values before changing fields.', 409)
         }
         after = entryID
-        const rows = (values ?? []) as ({ fieldKey: string } & Record<string, unknown>)[]
+        const rows = decodePayloadDynamicEntryValues(values ?? [], maxNestingDepth) as Array<
+          { fieldKey: string } & Record<string, unknown>
+        >
         for (const field of changed) {
           if (rows.some((row) => row.fieldKey === field.key && hasStoredValue(row))) {
             fieldConflict(
@@ -447,8 +456,10 @@ function fieldDefinitions(
   definitionSlug: CollectionSlug,
   scoped: boolean,
   storage: StorageNames,
+  maxNestingDepth: number,
   depth = 0,
 ): Field[] {
+  const names = nestingAliases(maxNestingDepth)
   const fields: Field[] = [
     { name: 'key', type: 'text', required: true, maxLength: 50 },
     {
@@ -460,7 +471,7 @@ function fieldDefinitions(
       name: 'fieldType',
       type: 'select',
       label: 'Type',
-      options: options.filter(({ value }) => fitsDepth(value, depth)),
+      options: options.filter(({ value }) => fitsDepth(value, depth, maxNestingDepth)),
       required: true,
       ...(depth > 0
         ? {
@@ -526,7 +537,7 @@ function fieldDefinitions(
       },
     },
     {
-      name: 'targetDefinition',
+      name: names.targetDefinition,
       type: 'relationship',
       label: 'Target collection',
       relationTo: definitionSlug,
@@ -561,15 +572,22 @@ function fieldDefinitions(
       admin: { condition: onlyFor('relationship', 'upload') },
     },
   ]
-  if (depth < definitionDepth) {
+  if (depth < maxNestingDepth) {
     fields.push({
-      name: 'fields',
+      name: names.fields,
       type: 'array',
       dbName: storage.nestedDefinitions(depth + 1),
       labels: { singular: 'Nested field', plural: 'Nested fields' },
       maxRows: maxDefinitionRows,
       admin: { condition: onlyFor(...structureTypes) },
-      fields: fieldDefinitions(options, definitionSlug, scoped, storage, depth + 1),
+      fields: fieldDefinitions(
+        options,
+        definitionSlug,
+        scoped,
+        storage,
+        maxNestingDepth,
+        depth + 1,
+      ),
     })
   }
   return fields
@@ -587,6 +605,7 @@ export function definitionCollection({
   definitionSlug,
   entrySlug,
   labels,
+  maxNestingDepth,
   postgres,
   singletons,
   storage,
@@ -596,12 +615,16 @@ export function definitionCollection({
   access?: PayloadDynamicAccess
   canManage: Access
   labels?: CollectionConfig['labels']
+  maxNestingDepth: number
   postgres: boolean
   singletons: boolean
   storage: StorageNames
   uploadCollection?: string
   workspace?: PayloadDynamicWorkspace
 }): CollectionConfig {
+  const names = nestingAliases(maxNestingDepth)
+  const readFields = (value: unknown) =>
+    decodePayloadDynamicDefinitionFields(value, maxNestingDepth) as DefinitionField[]
   const options = availableFieldTypes(postgres).filter(
     ({ value }) => value !== 'upload' || uploadCollection,
   )
@@ -692,7 +715,13 @@ export function definitionCollection({
         type: 'array',
         required: true,
         maxRows: maxDefinitionRows,
-        fields: fieldDefinitions(options, definitionSlug, Boolean(workspace), storage),
+        fields: fieldDefinitions(
+          options,
+          definitionSlug,
+          Boolean(workspace),
+          storage,
+          maxNestingDepth,
+        ),
       },
     ],
     hooks: {
@@ -730,7 +759,7 @@ export function definitionCollection({
             throw new APIError('Single entry is fixed after the collection is created.', 409)
           }
           if (data.fields === undefined) return data
-          const fields = await normalizeFields(data.fields, req, types)
+          const fields = await normalizeFields(readFields(data.fields), req, types, maxNestingDepth)
 
           if (operation === 'update' && originalDoc) {
             const synchronized = await lockDefinition(req, storage.definitions, originalDoc.id)
@@ -752,24 +781,26 @@ export function definitionCollection({
                 )
               }
             }
-            if (!preservesFields((originalDoc.fields ?? []) as DefinitionField[], fields)) {
+            const previous = readFields(originalDoc.fields ?? [])
+            if (!preservesFields(previous, fields)) {
               await assertSafeFieldChanges(
                 req,
                 entrySlug,
                 originalDoc.id,
-                (originalDoc.fields ?? []) as DefinitionField[],
+                previous,
                 fields,
                 synchronized,
+                maxNestingDepth,
               )
             }
           }
-          return { ...data, fields }
+          return { ...data, fields: encodePayloadDynamicDefinitionFields(fields, maxNestingDepth) }
         },
       ],
       beforeChange: [
         async ({ data, originalDoc, req }) => {
           const targetIDs = new Map<string, ID>()
-          collectTargets((data.fields ?? []) as DefinitionField[], targetIDs)
+          collectTargets(readFields(data.fields ?? []), targetIDs)
           if (targetIDs.size > 0) {
             const workspaceID = referenceID(data.workspace ?? originalDoc?.workspace)
             if (workspace && workspaceID === undefined) {
@@ -807,8 +838,10 @@ export function definitionCollection({
             req,
             where: {
               id: { not_equals: id },
-              or: Array.from({ length: definitionDepth + 1 }, (_, depth) => ({
-                [`${'fields.'.repeat(depth + 1)}targetDefinition`]: { equals: id },
+              or: Array.from({ length: maxNestingDepth + 1 }, (_, depth) => ({
+                [`fields.${`${names.fields}.`.repeat(depth)}${names.targetDefinition}`]: {
+                  equals: id,
+                },
               })),
             },
           })

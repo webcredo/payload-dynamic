@@ -44,7 +44,7 @@ Install the beta from npm.
 npm install payload-dynamic@beta
 ```
 
-If the npm beta tag is not available yet, install the tarball from the [GitHub releases](https://github.com/webcredo/payload-dynamic/releases), or install a local copy with `npm install ./payload-dynamic-0.2.0.tgz`.
+If the npm beta tag is not available yet, install the tarball from the [GitHub releases](https://github.com/webcredo/payload-dynamic/releases), or install a local copy with `npm install ./payload-dynamic-0.2.2.tgz`.
 
 ### Build a tarball from source
 
@@ -118,6 +118,7 @@ The root entry exports `payloadDynamic` and the types `PayloadDynamicOptions`, `
 | `uploadCollection`     | Payload `CollectionSlug`                 | Optional existing upload collection for upload fields. The plugin protects referenced uploads against deletion.   |
 | `uploadWorkspaceField` | `string`                                 | Optional relationship on the upload collection that identifies the file's workspace.                              |
 | `storagePrefix`        | `string`                                 | Optional prefix for the plugin's SQL tables and numeric value index.                                              |
+| `maxNestingDepth`      | `number`                                 | Limits nested fields to two by default and allows up to six on PostgreSQL.                                        |
 | `singletons`           | `boolean`                                | Opt in to collection definitions that allow at most one entry.                                                    |
 | `workspace`            | `PayloadDynamicWorkspace`                | Optional membership scope backed by an existing host collection.                                                  |
 | `enabled`              | `boolean`                                | Defaults to `true`. When `false`, returns the exact host config unchanged, without validating or adding anything. |
@@ -162,6 +163,10 @@ This example creates `content_definitions` and `content_entries` along with pref
 An existing plugin installation can keep its current names by leaving the option unset. Changing the prefix changes the target physical table names. To preserve existing data, prepare an explicit migration of definitions, entries, versions, child tables, indexes, foreign keys, and sequences, and verify the data in a restored copy before applying it.
 
 ### Nested values and row keys
+
+Set `maxNestingDepth: 6` on PostgreSQL to enable deeper layouts. Groups and arrays use one level. Blocks and tabs use two levels. Omitting the setting retains the existing two-level layout on PostgreSQL and SQLite.
+
+Depths above two use compact Payload field paths. Definitions keep the root `fields` array and store nested definitions in `f`. Entries keep the root `values` array and use `r` for rows and `i` for their items. Use the package's `encodePayloadDynamicDefinitionFields` and `encodePayloadDynamicEntryValues` helpers before writing the corresponding arrays through the API. Use `decodePayloadDynamicDefinitionFields` and `decodePayloadDynamicEntryValues` to read arrays with the usual field names. Pass the configured depth as the second argument to all four helpers. Regenerate Payload types and the admin import map after changing the layout. Existing installations need an explicit data and schema migration, including retained versions, before enabling a compact layout.
 
 Set `entries.preserveValuePresence: true` to store `valuePresence` on typed value rows. Use a row with `valuePresence: 'absent'` to import an absent value without applying its definition default. Pass `null` in the typed column to clear an optional value. Include `valuePresence: 'absent'` with that typed `null` to record it as absent. The returned marker distinguishes `'absent'`, `'null'` and `'value'`, including when an empty array reads back as `[]` for multiple states. A group or tabs value is present when `rows` contains its singleton item. Sending `rows: []` clears that group. To retain a present empty object, pass the singleton item with absent child values. Omitting the entire `values` array on update preserves saved values.
 
