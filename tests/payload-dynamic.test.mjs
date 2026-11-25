@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { postgresAdapter } from '@payloadcms/db-postgres'
 import { sqliteAdapter } from '@payloadcms/db-sqlite'
 import { buildConfig, createPayloadRequest, getPayload, handleEndpoints } from 'payload'
+import { reconcileSiblingRowKeys } from '../src/payload-dynamic/entry-values.ts'
 import { payloadDynamic } from '../src/payload-dynamic/index.ts'
 
 process.env.DISABLE_PAYLOAD_HMR = 'true'
@@ -2108,6 +2109,197 @@ test(
   () => withFixture(verifyPostgresFields, postgresURL),
 )
 
+for (const [adapter, url] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `typed values retain presence and sibling-scoped row keys on ${adapter}`,
+    { skip: adapter === 'PostgreSQL' && !url },
+    () =>
+      withFixture(
+        async ({ payload, manager }) => {
+          const leaf = { key: 'label', fieldType: 'text' }
+          const group = (key, ...fields) => ({ key, fieldType: 'group', fields })
+          const array = (key, ...fields) => ({ key, fieldType: 'array', fields })
+          const rows = (fieldKey, ...rows) => ({ fieldKey, rows })
+          const item = (rowKey, ...items) => ({ rowKey, items })
+          const textColumn = url ? 'jsonValue' : 'textValue'
+          const textLeaf = url ? { key: 'label', fieldType: 'json' } : leaf
+          const minimum = await createDefinition(manager, 'Minimum', 'minimum', [
+            { ...array('required_rows', leaf), minRows: 1 },
+          ])
+          await manager('POST', entries, 400, { title: 'Missing rows', definition: minimum.id })
+          const withRows = await createEntry(manager, 'One row', minimum.id, [
+            rows('required_rows', item('first')),
+          ])
+          await manager('PATCH', `${entries}/${withRows.id}`, 400, {
+            values: [{ fieldKey: 'required_rows', rows: null }],
+          })
+          const targetDefinition = await createDefinition(manager, 'Targets', 'targets', [leaf])
+          const target = await createEntry(manager, 'Nested link target', targetDefinition.id, [])
+          const link = {
+            key: 'link',
+            fieldType: 'relationship',
+            targetDefinition: targetDefinition.id,
+          }
+          const blocks = {
+            key: 'content',
+            fieldType: 'blocks',
+            fields: [group('card', textLeaf)],
+          }
+          const definition = await createDefinition(manager, 'Nested page', 'nested-page', [
+            group('section', array('items', textLeaf, link)),
+            blocks,
+            group('optional', { ...leaf, required: true }),
+            array('empty_array', leaf),
+            { key: 'empty_string', fieldType: 'text' },
+            ...(url ? [{ key: 'empty_json', fieldType: 'json' }] : []),
+            { key: 'defaulted', fieldType: 'text', defaultText: 'Default' },
+          ])
+          const section = rows(
+            'section',
+            item(
+              undefined,
+              rows(
+                'items',
+                item(
+                  'native-item-1',
+                  { fieldKey: 'label', [textColumn]: '[0,1]' },
+                  { fieldKey: 'link', relationshipValue: target.id },
+                ),
+                item('native-item-2', { fieldKey: 'label', [textColumn]: 'second' }),
+              ),
+            ),
+          )
+          const explicit = [
+            section,
+            rows('content', {
+              ...item('native-block', { fieldKey: 'label', [textColumn]: 'A card' }),
+              blockKey: 'card',
+            }),
+            { fieldKey: 'empty_array', rows: [] },
+            { fieldKey: 'empty_string', textValue: '' },
+            ...(url ? [{ fieldKey: 'empty_json', jsonValue: [], valuePresence: 'absent' }] : []),
+            { fieldKey: 'defaulted', valuePresence: 'absent' },
+          ]
+          const original = await createEntry(manager, 'Before', definition.id, explicit)
+          // The same Native row identities can exist under another entry.
+          const sibling = await createEntry(manager, 'Other entry', definition.id, explicit)
+          const nestedRows = (doc) =>
+            nestedValue(value(doc, 'section', 'rows')[0].items, 'items', 'rows')
+          const path = `${entries}/${original.id}?depth=0`
+          const read = await manager('GET', path, 200)
+          const stored = nestedRows(read)
+          assert.deepEqual(
+            stored.map(({ rowKey }) => rowKey),
+            ['native-item-1', 'native-item-2'],
+          )
+          assert.notEqual(stored[0].id, nestedRows(sibling)[0].id)
+          assert.equal(valueRow(stored[0].items, 'label')[textColumn], '[0,1]')
+          assert.equal(value(read, 'optional', 'valuePresence'), 'absent')
+          assert.equal(value(read, 'empty_array', 'valuePresence'), 'value')
+          assert.equal(value(read, 'empty_string', 'textValue'), '')
+          if (url) {
+            assert.equal(value(read, 'empty_json', 'valuePresence'), 'value')
+            assert.deepEqual(value(read, 'empty_json', 'jsonValue'), [])
+          }
+          assert.equal(value(read, 'defaulted', 'valuePresence'), 'absent')
+          assert.equal(value(read, 'content', 'rows')[0].rowKey, 'native-block')
+          await manager('DELETE', `${entries}/${target.id}`, 409)
+
+          const changed = structuredClone(explicit)
+          const changedRows = nestedRows({ values: changed })
+          changedRows.reverse()
+          await manager('PATCH', path, 400, {
+            values: [...changed, rows('optional', item(undefined))],
+          })
+          const { doc: updated } = await manager('PATCH', path, 200, {
+            title: 'Reordered',
+            values: [...changed, { fieldKey: 'optional', rows: null }],
+          })
+          assert.equal(value(updated, 'optional', 'valuePresence'), 'null')
+          assert.deepEqual(
+            nestedRows(updated).map(({ id }) => id),
+            stored.map(({ id }) => id).reverse(),
+          )
+          changedRows[1].rowKey = changedRows[0].rowKey
+          await manager('PATCH', path, 400, { values: changed })
+          const { doc: present } = await manager('PATCH', path, 200, {
+            values: [
+              ...explicit,
+              rows('optional', item(undefined, { fieldKey: 'label', textValue: 'Group value' })),
+            ],
+          })
+          assert.equal(value(present, 'optional', 'valuePresence'), 'value')
+          const { doc: cleared } = await manager('PATCH', path, 200, {
+            values: [...explicit, { fieldKey: 'optional', rows: [] }],
+          })
+          assert.equal(value(cleared, 'optional', 'valuePresence'), 'null')
+          const { doc: afterTitle } = await manager('PATCH', path, 200, { title: 'After' })
+          assert.equal(value(afterTitle, 'optional', 'valuePresence'), 'null')
+          const versions = await manager('GET', `${entries}/versions?depth=0`, 200)
+          const version = versions.docs.find(({ version }) => version.title === 'Before')
+          assert.ok(version)
+          assert.equal(value(version.version, 'optional', 'valuePresence'), 'absent')
+          assert.deepEqual(
+            nestedRows(version.version).map(({ rowKey }) => rowKey),
+            ['native-item-1', 'native-item-2'],
+          )
+          assert.equal(value(version.version, 'content', 'rows')[0].rowKey, 'native-block')
+          const restored = await manager('POST', `${entries}/versions/${version.id}?depth=0`, 200)
+          assert.equal(value(restored, 'optional', 'valuePresence'), 'absent')
+          assert.equal(valueRow(nestedRows(restored)[0].items, 'label')[textColumn], '[0,1]')
+
+          const legacy = structuredClone(version.version)
+          const legacyRow = nestedRows(legacy)[0]
+          legacyRow.id = 'legacy-array-item'
+          delete legacyRow.rowKey
+          const legacyVersion = await payload.db.createVersion({
+            collectionSlug: entrySlug,
+            parent: restored.id,
+            versionData: legacy,
+            createdAt: version.createdAt,
+            updatedAt: version.updatedAt,
+            autosave: false,
+          })
+          const restoreLegacy = () =>
+            manager('POST', `${entries}/versions/${legacyVersion.id}?depth=0`, 200)
+          const firstLegacyRestore = nestedRows(await restoreLegacy())[0]
+          assert.equal(firstLegacyRestore.rowKey, legacyRow.id)
+          const secondLegacyRestore = nestedRows(await restoreLegacy())[0]
+          assert.equal(secondLegacyRestore.rowKey, firstLegacyRestore.rowKey)
+          assert.equal(secondLegacyRestore.id, firstLegacyRestore.id)
+        },
+        url,
+        {
+          entries: { versions: true, preserveValuePresence: true, stableRowKeys: true },
+        },
+        [],
+        true,
+      ),
+  )
+}
+
+test('admin copies and pastes retain the existing row identity on overwrite', () => {
+  const rows = [
+    { id: 'copy-above', key: 'native-1' },
+    { id: 'old', key: 'pasted-from-another-entry' },
+    { id: 'copy-below', key: 'native-1' },
+    { id: 'different-sibling', key: 'native-2' },
+  ]
+  const { updates, owners } = reconcileSiblingRowKeys(rows, new Map([['native-1', 'old']]))
+  assert.equal(updates.size, 3)
+  assert.equal(updates.get(0), null)
+  assert.equal(updates.get(1), 'native-1')
+  assert.equal(updates.get(2), null)
+  assert.equal(owners.get('native-1'), 'old')
+  assert.equal(owners.get('native-2'), 'different-sibling')
+  const legacy = reconcileSiblingRowKeys([{ id: 'legacy' }], new Map())
+  const pasted = reconcileSiblingRowKeys([{ id: 'legacy', key: 'foreign-key' }], legacy.owners)
+  assert.equal(pasted.updates.get(0), 'legacy')
+})
+
 test('operation policies differentiate create and update during explicit validation', () =>
   withFixture(
     async ({ payload, manager, user, outsiderUser }) => {
@@ -2395,4 +2587,276 @@ for (const [adapter, url] of [
       true,
     )
   })
+}
+
+for (const [adapter, uri] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(`uploads always belong to the entry workspace on ${adapter}`, {
+    skip: adapter === 'PostgreSQL' && !uri,
+  }, async () => {
+    const workspaces = []
+    const validationEntered = Promise.withResolvers()
+    const finishValidation = Promise.withResolvers()
+    await withFixture(
+      async ({ payload, manager, user }) => {
+        const addWorkspace = (name) =>
+          payload.create({ collection: 'workspaces', data: { name }, user, overrideAccess: false })
+        const [north, south] = [await addWorkspace('North'), await addWorkspace('South')]
+        workspaces.push(north.id, south.id)
+        const addFile = (workspace, name) => {
+          const data = Buffer.from(name)
+          return payload.create({
+            collection: 'workspace-media',
+            data: { workspace },
+            user,
+            overrideAccess: false,
+            file: { name: `${name}.txt`, mimetype: 'text/plain', data, size: data.length },
+          })
+        }
+        const own = await addFile(north.id, 'north')
+        const other = await addFile(south.id, 'south')
+        const historical = await addFile(north.id, 'historical')
+        const { doc: definition } = await manager('POST', definitions, 201, {
+          title: 'Articles',
+          slug: 'articles',
+          workspace: north.id,
+          fields: [
+            { key: 'asset', fieldType: 'upload' },
+            { key: 'gallery', fieldType: 'upload', hasMany: true },
+            ...(uri ? [{ key: 'body', fieldType: 'richText' }] : []),
+          ],
+        })
+        const entryData = {
+          title: 'Article',
+          definition: definition.id,
+          values: [
+            { fieldKey: 'asset', uploadValue: own.id },
+            { fieldKey: 'gallery', uploadValues: [own.id] },
+          ],
+        }
+        assert.equal(
+          (await payload.validate({ collection: entrySlug, data: entryData, user })).valid,
+          true,
+        )
+        const { doc: entry } = await manager('POST', `${entries}?depth=0`, 201, entryData)
+        assert.equal(value(entry, 'asset', 'uploadValue'), own.id)
+        assert.deepEqual(value(entry, 'gallery', 'uploadValues'), [own.id])
+        const retained = await createEntry(manager, 'Retained file', definition.id, [
+          { fieldKey: 'asset', uploadValue: historical.id },
+        ])
+        await manager('PATCH', `${entries}/${retained.id}`, 200, { values: [] })
+        await manager('DELETE', `/api/workspace-media/${historical.id}`, 409)
+
+        await manager('PATCH', `${entries}/${entry.id}?draft=true`, 400, {
+          values: [{ fieldKey: 'gallery', uploadValues: [own.id, other.id] }],
+        })
+        await assert.rejects(
+          payload.create({
+            collection: entrySlug,
+            overrideAccess: true,
+            data: { ...entryData, values: [{ fieldKey: 'asset', uploadValue: other.id }] },
+          }),
+          { status: 400, message: /outside its target or inaccessible/ },
+        )
+        await assert.rejects(
+          payload.update({
+            collection: 'workspace-media',
+            id: own.id,
+            overrideAccess: true,
+            data: { workspace: south.id },
+          }),
+          { status: 400, message: /workspace of an uploaded file cannot be changed/ },
+        )
+
+        if (uri) {
+          const lexicalOnly = await addFile(north.id, 'lexical-only')
+          const embedded = (id) => {
+            const doc = lexicalDocument('Media attached')
+            doc.root.children.push({
+              type: 'upload',
+              id: 'embedded-file',
+              relationTo: 'workspace-media',
+              value: id,
+              fields: {},
+              format: '',
+              version: 1,
+            })
+            return { fieldKey: 'body', richTextValue: doc }
+          }
+          const valid = await payload.create({
+            collection: entrySlug,
+            depth: 0,
+            user,
+            overrideAccess: false,
+            data: { ...entryData, values: [embedded(lexicalOnly.id)] },
+          })
+          assert.equal(
+            value(valid, 'body', 'richTextValue').root.children.at(-1).value,
+            lexicalOnly.id,
+          )
+          await manager('DELETE', `/api/workspace-media/${lexicalOnly.id}`, 409)
+          await manager('PATCH', `${entries}/${valid.id}`, 200, { values: [] })
+          await manager('DELETE', `/api/workspace-media/${lexicalOnly.id}`, 409)
+          await assert.rejects(
+            payload.create({
+              collection: entrySlug,
+              overrideAccess: true,
+              data: { ...entryData, values: [...entryData.values, embedded(other.id)] },
+            }),
+            { status: 400, message: /rich text file is outside this workspace/ },
+          )
+
+          const attachment = await addFile(north.id, 'concurrent-attachment')
+          const save = payload.create({
+            collection: entrySlug,
+            context: { pauseScopedUploadValidation: true },
+            overrideAccess: true,
+            data: { ...entryData, values: [embedded(attachment.id)] },
+          })
+          await Promise.race([
+            validationEntered.promise,
+            save.then(() => assert.fail('Save finished before the upload validation pause.')),
+          ])
+          const deleting = payload
+            .delete({
+              collection: 'workspace-media',
+              id: attachment.id,
+              overrideAccess: true,
+            })
+            .then(
+              () => 200,
+              (error) => error.status,
+            )
+          let waiting = false
+          try {
+            const deadline = Date.now() + 3_000
+            while (!waiting && Date.now() < deadline) {
+              const result = await payload.db.pool.query(`
+                  SELECT 1 FROM pg_stat_activity
+                  WHERE wait_event_type = 'Lock' AND query LIKE '%workspace_media%for update%'
+                `)
+              waiting = result.rows.length > 0
+              if (!waiting) await new Promise((resolve) => setTimeout(resolve, 20))
+            }
+          } finally {
+            finishValidation.resolve()
+          }
+          await save
+          assert.equal(await deleting, 409)
+          assert.equal(waiting, true)
+        }
+
+        const later = new Date(Date.now() + 10_000).toISOString()
+        const imported = await payload.db.createVersion({
+          collectionSlug: entrySlug,
+          autosave: false,
+          createdAt: later,
+          parent: entry.id,
+          updatedAt: later,
+          versionData: {
+            ...entry,
+            values: entry.values.map((row) =>
+              row.fieldKey === 'asset' ? { ...row, uploadValue: other.id } : row,
+            ),
+          },
+        })
+        await manager('POST', `${entries}/versions/${imported.id}?depth=0`, 400)
+        const unused = await addFile(north.id, 'unused')
+        await manager('DELETE', `/api/workspace-media/${unused.id}`, 200)
+      },
+      uri,
+      {
+        ...entryDrafts,
+        workspace: { collection: 'workspaces', allowedIDs: () => workspaces },
+        uploadCollection: 'workspace-media',
+        uploadWorkspaceField: 'workspace',
+      },
+      [
+        { slug: 'workspaces', fields: [{ name: 'name', type: 'text' }] },
+        {
+          slug: 'workspace-media',
+          upload: { disableLocalStorage: true },
+          fields: [{ name: 'workspace', type: 'relationship', relationTo: 'workspaces' }],
+          hooks: {
+            afterRead: [
+              async ({ doc, req }) => {
+                if (req.context.pauseScopedUploadValidation) {
+                  validationEntered.resolve()
+                  await finishValidation.promise
+                }
+                return doc
+              },
+            ],
+          },
+        },
+      ],
+      true,
+    )
+  })
+}
+
+for (const [adapter, uri] of [
+  ['SQLite', undefined],
+  ['PostgreSQL', postgresURL],
+]) {
+  test(
+    `definitions retain their own entry history on ${adapter}`,
+    {
+      skip: adapter === 'PostgreSQL' && !uri,
+    },
+    () =>
+      withFixture(
+        async ({ payload, manager, user }) => {
+          const createDefinitionWithLimit = async (slug, limit) =>
+            (
+              await manager('POST', definitions, 201, {
+                title: slug,
+                slug,
+                fields: [capacity],
+                versionsMaxPerEntry: limit,
+              })
+            ).doc
+          const small = await createDefinitionWithLimit('small-history', 1)
+          const unlimited = await createDefinitionWithLimit('long-history', 0)
+          const checked = await payload.validate({
+            collection: entrySlug,
+            data: { title: 'Validation only', definition: small.id },
+            user,
+          })
+          assert.equal(checked.valid, true)
+          const tracked = await createEntry(manager, 'Limited record', small.id, [])
+          const sibling = await createEntry(manager, 'Sibling record', small.id, [])
+          const retained = await createEntry(manager, 'Unlimited record', unlimited.id, [])
+          const versions = async (id) =>
+            (
+              await manager(
+                'GET',
+                `${entries}/versions?where[parent][equals]=${id}&depth=0&sort=-id`,
+                200,
+              )
+            ).docs
+          const originalSibling = await versions(sibling.id)
+          const originalRetained = await versions(retained.id)
+          await manager('PATCH', `${entries}/${retained.id}`, 200, { title: 'Retained update' })
+          await manager('PATCH', `${entries}/${tracked.id}?draft=true&select[title]=true`, 200, {
+            title: 'Draft update',
+          })
+          const [draft] = await versions(tracked.id)
+          assert.equal(draft.version.title, 'Draft update')
+          assert.equal((await versions(tracked.id)).length, 1)
+          assert.equal((await versions(sibling.id))[0].id, originalSibling[0].id)
+          assert.ok((await versions(retained.id)).some(({ id }) => id === originalRetained[0].id))
+          await manager('POST', `${entries}/versions/${draft.id}?depth=0`, 200)
+          const restored = await versions(tracked.id)
+          assert.equal(restored.length, 1)
+          assert.equal(restored[0].version.title, 'Draft update')
+        },
+        uri,
+        { entries: { versions: { drafts: true, maxPerDoc: 0 }, retentionByDefinition: true } },
+        [],
+        true,
+      ),
+  )
 }

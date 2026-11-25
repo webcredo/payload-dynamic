@@ -3,6 +3,7 @@ import type { DefinitionField, FieldType } from './definitions'
 export type ID = number | string
 
 export const invalidJSONDraftKey = 'jsonEditorInvalid'
+export const valuePresenceOptions = ['absent', 'null', 'value'] as const
 
 export function referenceID(value: unknown): ID | undefined {
   if (value && typeof value === 'object' && 'id' in value) value = value.id
@@ -53,12 +54,71 @@ const allValueColumns = [
 // zero, JSON strings/collections, or nested rows as absent.
 export function hasStoredValue(row: Record<string, unknown>, exceptColumn?: string) {
   if (row[invalidJSONDraftKey] === true) return true
+  const presentColumn =
+    row.valuePresence === 'value' &&
+    typeof row.fieldType === 'string' &&
+    Object.hasOwn(valueColumns, row.fieldType)
+      ? valueColumn({ fieldType: row.fieldType as FieldType, hasMany: Boolean(row.fieldMany) })
+      : undefined
   return allValueColumns.some((column) => {
     const value = row[column]
-    if (column === exceptColumn || value == null) return false
+    if (column === exceptColumn) return false
+    if (column === presentColumn) return true
+    if (value == null) return false
     if (column === 'jsonValue' || column === 'richTextValue') return true
     return value !== '' && (!Array.isArray(value) || value.length > 0)
   })
+}
+
+export function isSingletonStructure(fieldType: FieldType) {
+  return fieldType === 'group' || fieldType === 'tabs'
+}
+
+export function reconcileSiblingRowKeys(
+  rows: { id?: string; key?: string | null }[],
+  previousOwners: ReadonlyMap<string, string>,
+) {
+  const originals = new Map<string, { index: number; id: string }>()
+  const updates = new Map<number, string | null>()
+  const previousKeys = new Map([...previousOwners].map(([key, id]) => [id, key]))
+  for (const [index, { id, key: incoming }] of rows.entries()) {
+    if (!id) continue
+    const key = previousKeys.get(id) || incoming || id
+    if (incoming && key !== incoming) updates.set(index, key)
+    const existing = originals.get(key)
+    if (existing === undefined) {
+      originals.set(key, { index, id })
+    } else if (previousOwners.get(key) === id) {
+      originals.set(key, { index, id })
+      updates.set(existing.index, null)
+    } else {
+      updates.set(index, null)
+    }
+  }
+  return {
+    updates,
+    owners: new Map([...originals].map(([key, { id }]) => [key, id])),
+  }
+}
+
+export function submittedValue(
+  row: Record<string, unknown> | undefined,
+  field: DefinitionField,
+  column: string,
+) {
+  const value = row?.[column]
+  const presence = row?.valuePresence
+  const storesRows =
+    column === 'rows' || column === 'relationshipValues' || column === 'uploadValues'
+  // Drizzle can return cleared arrays as [], even when the original write was null
+  // or omitted. JSON arrays are stored as values, including when empty.
+  if (value == null || (storesRows && Array.isArray(value) && value.length === 0)) {
+    if (presence === 'absent') return undefined
+    if (presence === 'null' || (column === 'rows' && isSingletonStructure(field.fieldType))) {
+      return value === undefined && presence !== 'null' ? undefined : null
+    }
+  }
+  return value
 }
 
 export function valueColumn({

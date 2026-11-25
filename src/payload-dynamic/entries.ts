@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
   type Access,
   APIError,
@@ -20,12 +21,7 @@ import {
   type PayloadDynamicAccess,
   type PayloadDynamicWorkspace,
 } from './access'
-import {
-  availableFieldTypes,
-  type DefinitionField,
-  definitionDepth,
-  type FieldType,
-} from './definitions'
+import { availableFieldTypes, type DefinitionField, type FieldType } from './definitions'
 import { type CollectionSlugs, entryDefinitionParam } from './entry-list'
 import { hasEntryMatching } from './entry-queries'
 import {
@@ -33,13 +29,24 @@ import {
   hasStoredValue,
   type ID,
   invalidJSONDraftKey,
+  isSingletonStructure,
   normalizeDate,
   referenceID,
+  submittedValue,
   valueColumn,
+  valuePresenceOptions,
 } from './entry-values'
+import {
+  decodePayloadDynamicDefinitionFields,
+  decodePayloadDynamicEntryValues,
+  encodePayloadDynamicEntryValues,
+  nestingAliases,
+  storageValueColumn,
+} from './nesting-layout'
 import { normalizePostgresValue, postgresValueFields } from './postgres-fields'
 import { lockDefinition } from './schema-transaction'
 import type { StorageNames } from './storage'
+import { assertRichTextUploadScope, lockScopedUploads, uploadWorkspaceFilter } from './upload-scope'
 
 export { hasEntryMatching as hasEntryValueReferences } from './entry-queries'
 
@@ -66,7 +73,16 @@ type ValueRow = { id?: string | null; fieldKey: string; fieldPath?: string } & R
   string,
   unknown
 >
-type NestedRow = { id?: string; blockKey?: string; items: ValueRow[] }
+type NestedRow = { id?: string; rowKey?: string; blockKey?: string; items: ValueRow[] }
+
+function isRowKey(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length <= 255 &&
+    !!value.trim() &&
+    !/[\0\p{Surrogate}]/u.test(value)
+  )
+}
 
 const visible =
   (type: FieldType, many?: boolean): Condition =>
@@ -91,11 +107,16 @@ function findField(fields: DefinitionField[], path: string) {
 
 export function entryValueReferences(
   id: ID,
+  maxNestingDepth: number,
   ...columns: ('relationshipValue' | 'relationshipValues' | 'uploadValue' | 'uploadValues')[]
 ): Where[] {
-  return Array.from({ length: definitionDepth + 1 }, (_, depth) =>
+  const names = nestingAliases(maxNestingDepth)
+  return Array.from({ length: maxNestingDepth + 1 }, (_, depth) =>
     columns.map((column) => ({
-      [`values${'.rows.items'.repeat(depth)}.${column}`]: { equals: id },
+      [`values${`.${names.rows}.${names.items}`.repeat(depth)}.${storageValueColumn(column, names)}`]:
+        {
+          equals: id,
+        },
     })),
   ).flat()
 }
@@ -104,6 +125,7 @@ function readSchema(
   req: PayloadRequest,
   definitionSlug: CollectionSlug,
   id: ID,
+  maxNestingDepth: number,
   overrideAccess = false,
 ) {
   return req.payload
@@ -118,7 +140,10 @@ function readSchema(
     .then((doc) =>
       doc && 'fields' in doc && Array.isArray(doc.fields)
         ? {
-            fields: doc.fields as DefinitionField[],
+            fields: decodePayloadDynamicDefinitionFields(
+              doc.fields,
+              maxNestingDepth,
+            ) as DefinitionField[],
             workspaceID: 'workspace' in doc ? referenceID(doc.workspace) : undefined,
           }
         : undefined,
@@ -128,12 +153,20 @@ function readSchema(
 function entryHooks({
   definitionSlug,
   entrySlug,
+  maxNestingDepth,
   uploadCollection,
+  uploadWorkspaceField,
   scoped,
+  preserveValuePresence,
+  stableRowKeys,
   storage,
 }: CollectionSlugs & {
+  maxNestingDepth: number
   uploadCollection?: CollectionSlug
+  uploadWorkspaceField?: string
   scoped: boolean
+  preserveValuePresence: boolean
+  stableRowKeys: boolean
   storage: StorageNames
 }) {
   type Operation = { req: PayloadRequest; overrideAccess: boolean; workspaceID?: ID }
@@ -168,14 +201,14 @@ function entryHooks({
     const key = String(id)
     let pending = byID.get(key)
     if (!pending) {
-      pending = readSchema(req, definitionSlug, id)
+      pending = readSchema(req, definitionSlug, id, maxNestingDepth)
       byID.set(key, pending)
     }
     return pending
   }
 
   const filterReferences =
-    (depth: number): FilterOptions =>
+    (depth: number, type: 'relationship' | 'upload' = 'relationship'): FilterOptions =>
     async ({ data, siblingData, req }) => {
       const id = referenceID(data?.definition)
       const row = siblingData as Partial<ValueRow> | undefined
@@ -184,8 +217,14 @@ function entryHooks({
       const schema = await getPickerSchema(req, id)
       if (!schema || (scoped && schema.workspaceID === undefined)) return false
       const field = findField(schema.fields, path)
+      if (field?.fieldType !== type) return false
+      if (type === 'upload') {
+        return uploadWorkspaceField === undefined || schema.workspaceID === undefined
+          ? false
+          : uploadWorkspaceFilter(uploadWorkspaceField, schema.workspaceID)
+      }
       const target = referenceID(field?.targetDefinition)
-      if (field?.fieldType !== 'relationship' || target === undefined) return false
+      if (target === undefined) return false
       return {
         definition: { equals: target },
         ...(scoped && { 'definition.workspace': { equals: schema.workspaceID } }),
@@ -216,10 +255,25 @@ function entryHooks({
     }
     if (!ids.length) return []
     const target = referenceID(field.targetDefinition)
-    const collection = field.fieldType === 'upload' ? uploadCollection : entrySlug
+    const isUpload = field.fieldType === 'upload'
+    const collection = isUpload ? uploadCollection : entrySlug
     if (!collection || (field.fieldType === 'relationship' && target === undefined)) {
       throw new APIError(`The target for ${field.label} is unavailable.`, 400)
     }
+    if (isUpload && uploadWorkspaceField !== undefined && workspaceID === undefined) {
+      throw new APIError(`The workspace for ${field.label} is unavailable.`, 400)
+    }
+    const rejected = () =>
+      new APIError(
+        `Some selections for ${field.label} are outside its target or inaccessible.`,
+        400,
+      )
+    if (
+      isUpload &&
+      uploadWorkspaceField !== undefined &&
+      !(await lockScopedUploads(req, collection, ids, 'reference'))
+    )
+      throw rejected()
     const { docs } = await req.payload.find({
       collection,
       depth: 0,
@@ -233,23 +287,35 @@ function entryHooks({
           definition: { equals: target },
           ...(scoped && { 'definition.workspace': { equals: workspaceID } }),
         }),
+        ...(isUpload &&
+          uploadWorkspaceField !== undefined &&
+          workspaceID !== undefined &&
+          uploadWorkspaceFilter(uploadWorkspaceField, workspaceID)),
       },
     })
-    if (docs.length !== ids.length) {
-      throw new APIError(
-        `Some selections for ${field.label} are outside its target or inaccessible.`,
-        400,
-      )
-    }
+    if (docs.length !== ids.length) throw rejected()
     return field.hasMany ? ids : ids[0]
   }
 
   async function normalizeValue(field: DefinitionField, value: unknown, operation: Operation) {
     if (field.fieldType === 'json' || field.fieldType === 'richText') {
-      return normalizePostgresValue(field.fieldType, value, {
+      const normalized = normalizePostgresValue(field.fieldType, value, {
         required: Boolean(field.required),
         label: field.label,
       })
+      if (
+        field.fieldType === 'richText' &&
+        uploadCollection &&
+        uploadWorkspaceField !== undefined
+      ) {
+        await assertRichTextUploadScope({
+          value: normalized,
+          collection: uploadCollection,
+          field: uploadWorkspaceField,
+          ...operation,
+        })
+      }
+      return normalized
     }
     if (
       value == null ||
@@ -257,6 +323,15 @@ function entryHooks({
       (Array.isArray(value) && value.length === 0 && field.hasMany)
     ) {
       if (field.required) throw new APIError(`${field.label} is required.`, 400)
+      if (preserveValuePresence) {
+        if (Array.isArray(value)) return []
+        if (value === '' && ['text', 'textarea', 'code'].includes(field.fieldType)) {
+          if (field.minLength) {
+            throw new APIError(`${field.label} is outside its configured length.`, 400)
+          }
+          return value
+        }
+      }
       return null
     }
     switch (field.fieldType) {
@@ -317,7 +392,7 @@ function entryHooks({
     operation: Operation,
   ): Promise<NestedRow[]> {
     const { fieldType, label } = field
-    const singleton = fieldType === 'group' || fieldType === 'tabs'
+    const singleton = isSingletonStructure(fieldType)
     const rows = value === undefined ? previousRows : value
     if (rows !== null && !Array.isArray(rows)) {
       throw new APIError(`${label}: rows must be an array.`, 400)
@@ -329,9 +404,14 @@ function entryHooks({
       throw new APIError(`${label}: provide between ${minRows} and ${maxRows} rows.`, 400)
     }
     const previous = new Map(previousRows.map((row) => [row.id, row]))
+    const previousKeys =
+      stableRowKeys && !singleton
+        ? new Map(previousRows.map((row) => [row.rowKey ?? row.id, row]))
+        : undefined
     const seen = new Set<string>()
+    const seenKeys = new Set<string>()
     const normalized = []
-    for (const row of singleton && !input.length ? [{}] : input) {
+    for (const row of singleton && !input.length && !preserveValuePresence ? [{}] : input) {
       if (!row || typeof row !== 'object' || Array.isArray(row)) {
         throw new APIError(`${label}: provide valid rows.`, 400)
       }
@@ -349,10 +429,28 @@ function entryHooks({
         if (seen.has(row.id)) throw new APIError(`${label}: row IDs must be distinct.`, 400)
         seen.add(row.id)
       }
-      const match = singleton ? previousRows[0] : previous.get(row.id)
+      const matchByID = singleton ? previousRows[0] : previous.get(row.id)
+      let rowKey: string | undefined
+      let match = matchByID
+      if (previousKeys) {
+        if (row.rowKey != null && !isRowKey(row.rowKey)) {
+          throw new APIError(`${label}: provide a valid row key.`, 400)
+        }
+        const previousKey = matchByID?.rowKey ?? matchByID?.id
+        if (row.rowKey != null && previousKey !== undefined && row.rowKey !== previousKey) {
+          throw new APIError(`${label}: existing row keys cannot change.`, 400)
+        }
+        const suppliedID = isRowKey(row.id) ? row.id : undefined
+        const key: string = row.rowKey ?? previousKey ?? suppliedID ?? randomUUID()
+        if (seenKeys.has(key)) throw new APIError(`${label}: row keys must be distinct.`, 400)
+        seenKeys.add(key)
+        rowKey = key
+        match = previousKeys.get(key)
+      }
       const previousRow = blockKey === (match?.blockKey ?? undefined) ? match : undefined
       normalized.push({
         id: previousRow?.id,
+        ...(rowKey !== undefined && { rowKey }),
         blockKey,
         items: await normalizeValues(
           fields,
@@ -421,21 +519,31 @@ function entryHooks({
       if (row && hasStoredValue(row, column)) {
         throw new APIError(`Use the ${field.fieldType} value for ${field.label}.`, 400)
       }
-      const submitted = row?.[column]
+      const submitted = preserveValuePresence ? submittedValue(row, field, column) : row?.[column]
+      const input =
+        !previousRow &&
+        submitted === undefined &&
+        !(preserveValuePresence && row?.valuePresence === 'absent')
+          ? (defaultValue(field) ?? undefined)
+          : submitted
+      if (preserveValuePresence && input == null) {
+        if (field.required) throw new APIError(`${field.label} is required.`, 400)
+        if (column === 'rows' && field.minRows) {
+          throw new APIError(`${field.label}: provide at least ${field.minRows} rows.`, 400)
+        }
+      }
       const normalized =
-        column === 'rows'
-          ? await normalizeRows(
-              field,
-              submitted,
-              Array.isArray(previousRow?.rows) ? previousRow.rows : [],
-              fieldPath,
-              operation,
-            )
-          : await normalizeValue(
-              field,
-              !previousRow && submitted === undefined ? defaultValue(field) : submitted,
-              operation,
-            )
+        preserveValuePresence && input == null
+          ? null
+          : column === 'rows'
+            ? await normalizeRows(
+                field,
+                input,
+                Array.isArray(previousRow?.rows) ? previousRow.rows : [],
+                fieldPath,
+                operation,
+              )
+            : await normalizeValue(field, input, operation)
       values.push({
         id: previousRow?.id,
         fieldKey: field.key,
@@ -443,6 +551,9 @@ function entryHooks({
         fieldType: field.fieldType,
         fieldLabel: field.label,
         fieldMany: Boolean(field.hasMany),
+        ...(preserveValuePresence && {
+          valuePresence: input === undefined ? 'absent' : normalized == null ? 'null' : 'value',
+        }),
         [column]: normalized,
       })
     }
@@ -472,7 +583,8 @@ function entryHooks({
     if (id === undefined || (previousID !== undefined && String(id) !== String(previousID))) {
       throw new APIError('Choose a collection when creating an entry. It cannot be changed.', 400)
     }
-    const synchronized = await lockDefinition(req, storage.definitions, id)
+    const synchronized =
+      req.operation !== 'validate' && (await lockDefinition(req, storage.definitions, id))
     if (synchronized && originalDoc?.id !== undefined) {
       const latest = await req.payload.findByID({
         collection: entrySlug,
@@ -488,15 +600,18 @@ function entryHooks({
         throw new APIError('The entry values changed. Reload the entry before saving.', 409)
       }
     }
-    const schema = await readSchema(req, definitionSlug, id, overrideAccess)
+    const schema = await readSchema(req, definitionSlug, id, maxNestingDepth, overrideAccess)
     if (!schema || (scoped && schema.workspaceID === undefined)) {
       throw new APIError('Collection definition is unavailable.', 400)
     }
-    return normalizeValues(schema.fields, value, originalDoc?.values ?? [], '', {
-      req,
-      overrideAccess,
-      workspaceID: schema.workspaceID,
-    })
+    const normalized = await normalizeValues(
+      schema.fields,
+      decodePayloadDynamicEntryValues(value, maxNestingDepth),
+      decodePayloadDynamicEntryValues(originalDoc?.values ?? [], maxNestingDepth) as ValueRow[],
+      '',
+      { req, overrideAccess, workspaceID: schema.workspaceID },
+    )
+    return encodePayloadDynamicEntryValues(normalized, maxNestingDepth)
   }
 
   return { prepareValues, filterReferences, rememberUpdateSource }
@@ -506,34 +621,50 @@ function entryHooks({
 const validateRelationship: typeof validations.relationship = (value, options) =>
   validations.relationship(value, { ...options, filterOptions: undefined })
 
+const validateUpload: typeof validations.upload = (value, options) =>
+  validations.upload(value, { ...options, filterOptions: undefined })
+
 export function entryCollection({
   access,
   canManage,
   definitionSlug,
   entrySlug,
   labels,
+  maxNestingDepth,
   postgres,
+  preserveValuePresence = false,
   singletons,
+  stableRowKeys = false,
   storage,
   uploadCollection,
+  uploadWorkspaceField,
   versions,
   workspace,
 }: CollectionSlugs & {
   access?: PayloadDynamicAccess
   canManage: Access
   labels?: CollectionConfig['labels']
+  maxNestingDepth: number
   postgres: boolean
+  preserveValuePresence?: boolean
   singletons: boolean
+  stableRowKeys?: boolean
   storage: StorageNames
   uploadCollection?: CollectionSlug
+  uploadWorkspaceField?: string
   versions?: CollectionConfig['versions']
   workspace?: PayloadDynamicWorkspace
 }): CollectionConfig {
+  const names = nestingAliases(maxNestingDepth)
   const { prepareValues, filterReferences, rememberUpdateSource } = entryHooks({
     definitionSlug,
     entrySlug,
+    maxNestingDepth,
     uploadCollection,
+    uploadWorkspaceField,
     scoped: Boolean(workspace),
+    preserveValuePresence,
+    stableRowKeys,
     storage,
   })
   const fieldTypes = availableFieldTypes(postgres).map(({ value }) => value)
@@ -642,7 +773,7 @@ export function entryCollection({
         },
       },
       {
-        name: 'relationshipValue',
+        name: names.relationshipValue,
         type: 'relationship',
         label: 'Related entry',
         relationTo: entrySlug,
@@ -661,17 +792,34 @@ export function entryCollection({
         admin: { allowCreate: false, condition: visible('relationship', true) },
       },
     ]
+    if (preserveValuePresence) {
+      fields.push({
+        name: 'valuePresence',
+        type: 'select',
+        options: [...valuePresenceOptions],
+        admin: { hidden: true },
+      })
+    }
     if (depth > 0) {
       fields.push({ name: 'fieldPath', type: 'text', admin: { hidden: true } })
     }
-    if (postgres) fields.push(...postgresValueFields())
+    if (postgres)
+      fields.push(...postgresValueFields(uploadWorkspaceField ? uploadCollection : undefined))
     if (uploadCollection) {
+      const uploadPicker =
+        uploadWorkspaceField === undefined
+          ? {}
+          : {
+              filterOptions: filterReferences(depth, 'upload'),
+              validate: validateUpload,
+            }
       fields.push(
         {
-          name: 'uploadValue',
+          name: names.uploadValue,
           type: 'upload',
           label: 'File value',
           relationTo: uploadCollection,
+          ...uploadPicker,
           admin: { condition: visible('upload', false) },
         },
         {
@@ -679,26 +827,33 @@ export function entryCollection({
           type: 'upload',
           label: 'File values',
           relationTo: uploadCollection,
+          ...uploadPicker,
           hasMany: true,
           admin: { condition: visible('upload', true) },
         },
       )
     }
-    if (depth < definitionDepth) {
+    if (depth < maxNestingDepth) {
       const level = depth + 1
       fields.push({
-        name: 'rows',
+        name: names.rows,
         type: 'array',
         dbName: storage.entryRows(level),
         maxRows: 100,
         admin: {
           condition: visibleFor('array', 'group', 'blocks', 'tabs'),
           components: {
-            Field: entryAdminComponents.nestedRowsField,
+            Field: {
+              path: entryAdminComponents.nestedRowsField,
+              clientProps: { preserveValuePresence, stableRowKeys, maxNestingDepth },
+            },
             RowLabel: entryAdminComponents.nestedRowLabel,
           },
         },
         fields: [
+          ...(stableRowKeys
+            ? [{ name: 'rowKey', type: 'text' as const, maxLength: 255, admin: { hidden: true } }]
+            : []),
           {
             name: 'blockKey',
             type: 'text',
@@ -706,7 +861,7 @@ export function entryCollection({
             admin: { components: { Field: entryAdminComponents.blockTypeField } },
           },
           {
-            name: 'items',
+            name: names.items,
             type: 'array',
             dbName: storage.entryItems(level),
             maxRows: 100,
@@ -789,7 +944,7 @@ export function entryCollection({
         relationTo: definitionSlug,
         required: true,
         defaultValue: ({ req }) => scopedDefinitionID(req),
-        access: { update: () => false },
+        access: { update: ({ id, req }) => req.operation === 'validate' && id === undefined },
         admin: { hidden: true },
       },
       ...singletonFields,
@@ -801,7 +956,7 @@ export function entryCollection({
           components: {
             Field: {
               path: entryAdminComponents.arrayField,
-              clientProps: { definitionSlug, entrySlug },
+              clientProps: { definitionSlug, entrySlug, preserveValuePresence, maxNestingDepth },
             },
             RowLabel: entryAdminComponents.rowLabel,
           },
@@ -830,7 +985,12 @@ export function entryCollection({
         async ({ id, req }) => {
           const referenced = await hasEntryMatching(req, entrySlug, {
             id: { not_equals: id },
-            or: entryValueReferences(id, 'relationshipValue', 'relationshipValues'),
+            or: entryValueReferences(
+              id,
+              maxNestingDepth,
+              'relationshipValue',
+              'relationshipValues',
+            ),
           })
           if (referenced) throw new APIError('Another entry still links to this entry.', 409)
         },

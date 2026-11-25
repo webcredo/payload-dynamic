@@ -44,7 +44,7 @@ Install the beta from npm.
 npm install payload-dynamic@beta
 ```
 
-If the npm beta tag is not available yet, install the tarball from the [GitHub releases](https://github.com/webcredo/payload-dynamic/releases), or install a local copy with `npm install ./payload-dynamic-0.2.0.tgz`.
+If the npm beta tag is not available yet, install the tarball from the [GitHub releases](https://github.com/webcredo/payload-dynamic/releases), or install a local copy with `npm install ./payload-dynamic-0.2.2.tgz`.
 
 ### Build a tarball from source
 
@@ -112,16 +112,18 @@ Use your application's normal migration workflow for production. The plugin exte
 
 The root entry exports `payloadDynamic` and the types `PayloadDynamicOptions`, `PayloadDynamicAccess`, and `PayloadDynamicWorkspace`.
 
-| Option             | Type                                     | Meaning                                                                                                           |
-| ------------------ | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `canManage`        | Payload `Access`                         | Fallback access policy for definitions and entries. Apply an appropriate authenticated or role-based policy.      |
-| `uploadCollection` | Payload `CollectionSlug`                 | Optional existing upload collection for upload fields. The plugin protects referenced uploads against deletion.   |
-| `storagePrefix`    | `string`                                 | Optional prefix for the plugin's SQL tables and numeric value index.                                              |
-| `singletons`       | `boolean`                                | Opt in to collection definitions that allow at most one entry.                                                    |
-| `workspace`        | `PayloadDynamicWorkspace`                | Optional membership scope backed by an existing host collection.                                                  |
-| `enabled`          | `boolean`                                | Defaults to `true`. When `false`, returns the exact host config unchanged, without validating or adding anything. |
-| `collections`      | `{ slug?, labels?, access? }`            | Overrides the definitions collection. Defaults to `collections` with **Collection** / **Collections** labels.     |
-| `entries`          | `{ slug?, labels?, access?, versions? }` | Overrides the records collection. Defaults to `entries` with **Entry** / **Entries** labels.                      |
+| Option                 | Type                                     | Meaning                                                                                                           |
+| ---------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `canManage`            | Payload `Access`                         | Fallback access policy for definitions and entries. Apply an appropriate authenticated or role-based policy.      |
+| `uploadCollection`     | Payload `CollectionSlug`                 | Optional existing upload collection for upload fields. The plugin protects referenced uploads against deletion.   |
+| `uploadWorkspaceField` | `string`                                 | Optional relationship on the upload collection that identifies the file's workspace.                              |
+| `storagePrefix`        | `string`                                 | Optional prefix for the plugin's SQL tables and numeric value index.                                              |
+| `maxNestingDepth`      | `number`                                 | Limits nested fields to two by default and allows up to six on PostgreSQL.                                        |
+| `singletons`           | `boolean`                                | Opt in to collection definitions that allow at most one entry.                                                    |
+| `workspace`            | `PayloadDynamicWorkspace`                | Optional membership scope backed by an existing host collection.                                                  |
+| `enabled`              | `boolean`                                | Defaults to `true`. When `false`, returns the exact host config unchanged, without validating or adding anything. |
+| `collections`          | `{ slug?, labels?, access? }`            | Overrides the definitions collection. Defaults to `collections` with **Collection** / **Collections** labels.     |
+| `entries`              | `{ slug?, labels?, access?, versions? }` | Overrides the records collection. Defaults to `entries` with **Entry** / **Entries** labels.                      |
 
 Each override is optional. The `access` object accepts `create`, `read`, `update`, and `delete` callbacks and replaces `canManage` for the specified operations. Return a boolean from `create`. Reads, updates, and deletes also accept native Payload `Where` constraints. Set `labels.singular` and `labels.plural` independently using Payload's collection label format. Scoped lists and breadcrumbs show the selected record type's title.
 
@@ -160,6 +162,18 @@ This example creates `content_definitions` and `content_entries` along with pref
 
 An existing plugin installation can keep its current names by leaving the option unset. Changing the prefix changes the target physical table names. To preserve existing data, prepare an explicit migration of definitions, entries, versions, child tables, indexes, foreign keys, and sequences, and verify the data in a restored copy before applying it.
 
+### Nested values and row keys
+
+Set `maxNestingDepth: 6` on PostgreSQL to enable deeper layouts. Groups and arrays use one level. Blocks and tabs use two levels. Omitting the setting retains the existing two-level layout on PostgreSQL and SQLite.
+
+Depths above two use compact Payload field paths. Definitions keep the root `fields` array and store nested definitions in `f`. Entries keep the root `values` array and use `r` for rows and `i` for their items. Use the package's `encodePayloadDynamicDefinitionFields` and `encodePayloadDynamicEntryValues` helpers before writing the corresponding arrays through the API. Use `decodePayloadDynamicDefinitionFields` and `decodePayloadDynamicEntryValues` to read arrays with the usual field names. Pass the configured depth as the second argument to all four helpers. Regenerate Payload types and the admin import map after changing the layout. Existing installations need an explicit data and schema migration, including retained versions, before enabling a compact layout.
+
+Set `entries.preserveValuePresence: true` to store `valuePresence` on typed value rows. Use a row with `valuePresence: 'absent'` to import an absent value without applying its definition default. Pass `null` in the typed column to clear an optional value. Include `valuePresence: 'absent'` with that typed `null` to record it as absent. The returned marker distinguishes `'absent'`, `'null'` and `'value'`, including when an empty array reads back as `[]` for multiple states. A group or tabs value is present when `rows` contains its singleton item. Sending `rows: []` clears that group. To retain a present empty object, pass the singleton item with absent child values. Omitting the entire `values` array on update preserves saved values.
+
+Set `entries.stableRowKeys: true` to store a logical `rowKey` on each array or block row. An importer can pass a source string ID as `rowKey`. Keys must be unique among sibling rows and remain attached to those rows when reordered. The plugin generates a key for a new row when none is supplied. Existing rows can use their current Payload `id` as the logical key through the first save. The Payload `id` still identifies the internal SQL row. `rowKey` is the scoped identity to use across installations.
+
+Each entry option adds columns to the current and version storage. Review and apply a database migration before enabling these options on existing storage. Previously normalized null and absent values cannot be recovered from legacy rows unless an independent source retained that distinction.
+
 ### Single-entry collections
 
 Set `singletons: true` to enable the optional `singleton` checkbox on collection definitions. Create a definition with `singleton: true` to allow at most one current entry. The setting is fixed at creation. Regular collections continue to allow multiple entries.
@@ -167,6 +181,8 @@ Set `singletons: true` to enable the optional `singleton` checkbox on collection
 Use the existing Entries API and scope the lookup to the definition ID. Update the existing entry and use its normal Payload version history. Creating or duplicating a second entry for the same definition fails, even with concurrent requests. Deleting the entry permits a new one.
 
 Use `entries: { versions: { drafts: true, maxPerDoc: 0 } }` to enable drafts and retain all versions for Entries. The setting applies to every entry in the collection. Choose the retention policy before importing history so later writes preserve the imported versions.
+
+Set `entries.retentionByDefinition: true` with `entries.versions.maxPerDoc: 0` to set different history limits on individual definitions. `versionsMaxPerEntry` on a definition controls retention after each entry save. Versions tied at the cutoff timestamp stay together. Zero or an unset limit retains all versions. Use database transactions for this option. On SQLite, enable transactions with the adapter's `transactionOptions`. For existing storage, apply a database migration for the new definition field before enabling the option.
 
 Enable drafts on fresh or empty entry storage. For populated storage, first verify a data backfill on a restored copy that creates a matching published latest version for every existing entry. Applying the schema migration alone leaves existing entries out of Payload's draft views. Dynamic required fields are validated on every draft save, including when Payload's `drafts.validate` is `false`.
 
@@ -201,6 +217,8 @@ The example uses host-defined role and membership functions. Resolve membership 
 Select a workspace when creating a definition. Slugs are unique within that workspace, and the workspace is fixed after creation. Duplicated definitions keep their workspace and receive a new slug. Entries inherit the definition's workspace. Dynamic relationship fields stay within that workspace. The plugin blocks permanent deletion while a workspace owns definitions. The host decides whether archived or trashed workspaces remain eligible in `allowedIDs`. The host upload collection controls file access.
 
 Enabling workspace mode changes the SQL schema. For an existing installation, prepare a migration that assigns workspace IDs to current definitions and their retained versions before enforcing the required relationship and per-workspace slug index. Keep linked definitions and existing relationship values in the same workspace, or remap those links before enabling the feature. Existing configurations that omit `workspace` use the same tables and global slug uniqueness.
+
+With `uploadWorkspaceField: 'team'`, configure `team` as a single, non-localized relationship on the upload collection pointing to the workspace collection. An entry's uploads and Rich Text file references must belong to its definition's workspace, including for privileged saves and version restores. A file remains protected from deletion while current content or a retained version references it. Use database transactions for entry saves and media deletion. On SQLite, enable transactions with the adapter's `transactionOptions`. The host controls direct file access and should scope its upload collection to workspace members. Assign workspaces to existing uploads before enabling the setting and verify that current and retained content links to files in the same workspace. After activation, the workspace is fixed from upload creation.
 
 ### Admin components and import map
 
