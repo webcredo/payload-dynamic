@@ -14,6 +14,17 @@ import type { PayloadDynamicAccess, PayloadDynamicWorkspace } from './access'
 import { definitionCollection, definitionDepth } from './definitions'
 import { entryCollection, entryValueReferences, hasEntryValueReferences } from './entries'
 import { createStorageNames, protectStorageNamespace, type StorageNames } from './storage'
+import {
+  assertUploadWorkspaceField,
+  hasRichTextUploadReference,
+  lockScopedUploads,
+  preserveUploadWorkspace,
+} from './upload-scope'
+import {
+  requireVersionRetentionTransaction,
+  retainEntryVersions,
+  versionRetentionField,
+} from './version-retention'
 
 // SQL adapters store Array rows in their own table. CollectionConfig.indexes
 // applies to the parent table; this index covers a range on a single field key.
@@ -92,12 +103,32 @@ const preservePostgresJSONStrings =
   }
 
 const preventReferencedUploadDeletion =
-  (entrySlug: CollectionSlug): CollectionBeforeDeleteHook =>
-  async ({ id, req }) => {
-    const referenced = await hasEntryValueReferences(req, entrySlug, {
-      or: entryValueReferences(id, 'uploadValue', 'uploadValues'),
-    })
-    if (referenced) throw new APIError('Remove references to this file before deleting it.', 409)
+  (entrySlug: CollectionSlug, storage: StorageNames, scoped: boolean): CollectionBeforeDeleteHook =>
+  async ({ collection, id, req }) => {
+    const paths = entryValueReferences(id, 'uploadValue', 'uploadValues')
+    const conflict = () => new APIError('Remove references to this file before deleting it.', 409)
+    if (scoped && !(await lockScopedUploads(req, collection.slug, [id], 'delete'))) return
+    if (await hasEntryValueReferences(req, entrySlug, { or: paths })) throw conflict()
+    if (!scoped) return
+
+    if (req.payload.collections[entrySlug].config.versions) {
+      const { docs } = await req.payload.db.findVersions({
+        collection: entrySlug,
+        req,
+        limit: 1,
+        pagination: false,
+        where: {
+          or: paths.flatMap((where) =>
+            Object.entries(where).map(([key, value]) => ({ [`version.${key}`]: value })),
+          ),
+        },
+        select: { id: true },
+      })
+      if (docs.length) throw conflict()
+    }
+    if (await hasRichTextUploadReference(req, storage, definitionDepth, collection.slug, id)) {
+      throw conflict()
+    }
   }
 
 const preventReferencedWorkspaceDeletion =
@@ -126,13 +157,23 @@ export type PayloadDynamicOptions = {
   enabled?: boolean
   canManage: Access
   uploadCollection?: CollectionSlug
+  /** Single relationship from the upload collection to the configured workspace. */
+  uploadWorkspaceField?: string
   workspace?: PayloadDynamicWorkspace
   /** Prefix to use for physical SQL storage in a shared database. */
   storagePrefix?: string
   /** Allow definitions whose entries are limited to one document. */
   singletons?: boolean
   collections?: CollectionOverrides
-  entries?: CollectionOverrides & Pick<CollectionConfig, 'versions'>
+  entries?: CollectionOverrides &
+    Pick<CollectionConfig, 'versions'> & {
+      /** Distinguish absent, null and populated typed values in entry storage. */
+      preserveValuePresence?: boolean
+      /** Store sibling-scoped row keys for arrays and blocks. */
+      stableRowKeys?: boolean
+      /** Read version limits from individual definitions instead of the Entries collection. */
+      retentionByDefinition?: boolean
+    }
 }
 
 const routeSlug = /^[a-zA-Z0-9_-]+$/
@@ -197,6 +238,7 @@ function validateNames(
 export function payloadDynamic({
   canManage,
   uploadCollection,
+  uploadWorkspaceField,
   workspace,
   storagePrefix,
   singletons = false,
@@ -221,6 +263,20 @@ export function payloadDynamic({
     if (workspace && !collections.some(({ slug }) => slug === workspace.collection)) {
       throw new Error('The configured workspace must be an existing Payload collection.')
     }
+    if (uploadWorkspaceField !== undefined) {
+      assertUploadWorkspaceField(
+        collections.find(({ slug }) => slug === uploadCollection),
+        workspace?.collection,
+        uploadWorkspaceField,
+      )
+    }
+    const entryVersions = entryOptions?.versions
+    if (
+      entryOptions?.retentionByDefinition &&
+      (typeof entryVersions !== 'object' || entryVersions.maxPerDoc !== 0)
+    ) {
+      throw new Error('retentionByDefinition requires entries.versions.maxPerDoc to be zero.')
+    }
 
     const slugs = { definitionSlug, entrySlug }
     const options = {
@@ -230,41 +286,57 @@ export function payloadDynamic({
       singletons,
       postgres: config.db.name === 'postgres',
       uploadCollection,
+      uploadWorkspaceField,
       workspace,
     }
     const hosts = collections.map((collection) => {
       const guards: CollectionBeforeDeleteHook[] = []
+      const uploadScope = collection.slug === uploadCollection ? uploadWorkspaceField : undefined
       if (collection.slug === uploadCollection)
-        guards.push(preventReferencedUploadDeletion(entrySlug))
+        guards.push(preventReferencedUploadDeletion(entrySlug, storage, uploadScope !== undefined))
       if (collection.slug === workspace?.collection) {
         guards.push(preventReferencedWorkspaceDeletion(definitionSlug))
       }
-      return guards.length
+      return guards.length || uploadScope
         ? {
             ...collection,
             hooks: {
               ...collection.hooks,
               beforeDelete: [...guards, ...(collection.hooks?.beforeDelete ?? [])],
+              ...(uploadScope && {
+                beforeChange: [
+                  ...(collection.hooks?.beforeChange ?? []),
+                  preserveUploadWorkspace(uploadScope),
+                ],
+              }),
             },
           }
         : collection
     })
+    const definitions = definitionCollection({
+      ...options,
+      access: definitionOptions?.access,
+      labels: definitionOptions?.labels,
+    })
+    const entries = entryCollection({
+      ...options,
+      access: entryOptions?.access,
+      labels: entryOptions?.labels,
+      preserveValuePresence: entryOptions?.preserveValuePresence,
+      stableRowKeys: entryOptions?.stableRowKeys,
+      versions: entryVersions,
+    })
+    if (entryOptions?.retentionByDefinition) {
+      definitions.fields.push({ ...versionRetentionField })
+      entries.hooks = {
+        ...entries.hooks,
+        beforeChange: [requireVersionRetentionTransaction, ...(entries.hooks?.beforeChange ?? [])],
+        afterChange: [...(entries.hooks?.afterChange ?? []), retainEntryVersions(definitionSlug)],
+      }
+    }
     return {
       ...config,
-      collections: [
-        ...hosts,
-        definitionCollection({
-          ...options,
-          access: definitionOptions?.access,
-          labels: definitionOptions?.labels,
-        }),
-        entryCollection({
-          ...options,
-          access: entryOptions?.access,
-          labels: entryOptions?.labels,
-          versions: entryOptions?.versions,
-        }),
-      ],
+      collections: [...hosts, definitions, entries],
       admin: {
         ...config.admin,
         components: {

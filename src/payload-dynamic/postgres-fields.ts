@@ -1,4 +1,9 @@
-import { editorConfigFactory, getEnabledNodes, lexicalEditor } from '@payloadcms/richtext-lexical'
+import {
+  editorConfigFactory,
+  getEnabledNodes,
+  lexicalEditor,
+  UploadFeature,
+} from '@payloadcms/richtext-lexical'
 import {
   LineBreakNode,
   ParagraphNode,
@@ -6,7 +11,14 @@ import {
   TextNode,
 } from '@payloadcms/richtext-lexical/lexical'
 import { hasText } from '@payloadcms/richtext-lexical/shared'
-import { APIError, type Field, type RichTextFieldValidation, validations } from 'payload'
+import {
+  APIError,
+  type CollectionSlug,
+  type Field,
+  type RichTextFieldValidation,
+  type UploadCollectionSlug,
+  validations,
+} from 'payload'
 
 const validateRichText: RichTextFieldValidation = async (value, field) => {
   if (value != null) {
@@ -50,7 +62,7 @@ const validateRichText: RichTextFieldValidation = async (value, field) => {
   return validations.richText(value, field)
 }
 
-export function postgresValueFields(): Field[] {
+export function postgresValueFields(uploadCollection?: CollectionSlug): Field[] {
   return [
     {
       name: 'jsonValue',
@@ -67,7 +79,16 @@ export function postgresValueFields(): Field[] {
       name: 'richTextValue',
       type: 'richText',
       label: 'Rich text value',
-      editor: lexicalEditor(),
+      editor: lexicalEditor(
+        uploadCollection
+          ? {
+              features: ({ defaultFeatures }) => [
+                ...defaultFeatures.filter(({ key }) => key !== 'upload'),
+                UploadFeature({ enabledCollections: [uploadCollection as UploadCollectionSlug] }),
+              ],
+            }
+          : undefined,
+      ),
       validate: validateRichText,
       admin: { condition: (_, row) => row.fieldType === 'richText' },
     },
